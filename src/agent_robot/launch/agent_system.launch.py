@@ -30,4 +30,16 @@ def generate_launch_description():
             name='scene_visualizer',
             output='screen'
         ),
+        Node(
+            package='agent_robot',
+            executable='scene_loader',
+            name='scene_loader',
+            output='screen'
+        ),
+        Node(
+            package='agent_robot',
+            executable='pybullet_bridge',
+            name='pybullet_bridge',
+            output='screen'
+        ),
     ])

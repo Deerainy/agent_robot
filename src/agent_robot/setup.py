@@ -17,6 +17,10 @@ setup(
             os.path.join('share', package_name, 'launch'),
             glob('launch/*.launch.py')
         ),
+        (
+            'share/' + package_name + '/images',
+            ['images/scene.png']
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -35,6 +39,8 @@ setup(
             'environment_node = agent_robot.environment_node:main',
             'vision_node = agent_robot.vision_node:main',
             'scene_visualizer = agent_robot.scene_visualizer:main',
+            'scene_loader = agent_robot.scene_loader:main',
+            'pybullet_bridge = agent_robot.pybullet_bridge:main',
         ],
     },
 )

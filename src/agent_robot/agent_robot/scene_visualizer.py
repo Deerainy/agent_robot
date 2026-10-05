@@ -19,11 +19,16 @@ class SceneVisualizer(Node):
             self.execution_status_callback,
             10
         )
+        self.command_publisher = self.create_publisher(
+            String,
+            '/user_command',
+            10
+        )
 
         # 创建可视化窗口
         self.root = tk.Tk()
         self.root.title('EmbodiedPlan - Scene Visualizer')
-        self.root.geometry('900x600')
+        self.root.geometry('900x650')
         self.root.resizable(False, False)
 
         self.canvas = tk.Canvas(
@@ -34,6 +39,52 @@ class SceneVisualizer(Node):
             highlightthickness=0
         )
         self.canvas.pack()
+
+        # 用户任务输入区域
+        self.command_frame = tk.Frame(
+            self.root,
+            bg='#eceff1',
+            padx=12,
+            pady=10
+        )
+        self.command_frame.pack(fill='x')
+
+        self.command_entry = tk.Entry(
+            self.command_frame,
+            font=('Arial', 13)
+        )
+        self.command_entry.pack(
+            side='left',
+            fill='x',
+            expand=True,
+            padx=(0, 10),
+            ipady=6
+        )
+
+        self.command_entry.insert(
+            0,
+            'Pick up the red apple and place it into the basket.'
+        )
+
+        self.send_button = tk.Button(
+            self.command_frame,
+            text='Send Task',
+            font=('Arial', 12, 'bold'),
+            bg='#1976d2',
+            fg='white',
+            activebackground='#1565c0',
+            activeforeground='white',
+            command=self.send_command,
+            padx=18,
+            pady=5
+        )
+        self.send_button.pack(side='right')
+
+        # 按 Enter 也可以发送任务
+        self.command_entry.bind(
+            '<Return>',
+            lambda event: self.send_command()
+        )
 
         self.status_label = tk.Label(
             self.root,
@@ -57,6 +108,30 @@ class SceneVisualizer(Node):
         self.create_timer(0.05, self.update_window)
 
         self.get_logger().info('Scene visualizer started.')
+
+    def send_command(self):
+        """把输入框中的自然语言任务发布到 ROS 2。"""
+        command = self.command_entry.get().strip()
+
+        if not command:
+            self.status_label.config(
+                text='Please enter a task command.',
+                bg='#b71c1c'
+            )
+            return
+
+        message = String()
+        message.data = command
+        self.command_publisher.publish(message)
+
+        self.status_label.config(
+            text=f'Task submitted: {command}',
+            bg='#1565c0'
+        )
+
+        self.get_logger().info(
+            f'Published user command: {command}'
+        )
 
     def update_window(self):
         """在 ROS 2 循环中刷新 Tkinter 窗口。"""
