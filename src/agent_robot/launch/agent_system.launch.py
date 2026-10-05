@@ -6,8 +6,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='agent_robot',
-            executable='environment_node',
-            name='environment_node',
+            executable='vision_node',
+            name='vision_node',
             output='screen'
         ),
 

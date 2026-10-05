@@ -30,6 +30,7 @@ setup(
             'task_planner = agent_robot.task_planner:main',
             'task_executor = agent_robot.task_executor:main',
             'environment_node = agent_robot.environment_node:main',
+            'vision_node = agent_robot.vision_node:main',
         ],
     },
 )
