@@ -23,5 +23,11 @@ def generate_launch_description():
             executable='task_executor',
             name='task_executor',
             output='screen'
-        )
+        ),
+        Node(
+            package='agent_robot',
+            executable='scene_visualizer',
+            name='scene_visualizer',
+            output='screen'
+        ),
     ])

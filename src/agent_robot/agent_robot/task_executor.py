@@ -107,6 +107,23 @@ class TaskExecutor(Node):
                 self.get_logger().info(
                     f'Executing step {index}/{len(steps)}: {step}'
                 )
+                step_status = {
+                    'command': command,
+                    'status': 'completed',
+                    'step': step,
+                    'step_index': index,
+                    'total_steps': len(steps)
+                }
+
+                step_msg = String()
+                step_msg.data = json.dumps(
+                    step_status,
+                    ensure_ascii=False
+                )
+                self.status_publisher.publish(step_msg)
+
+                # 留出时间展示每一步的画面变化
+                time.sleep(1.0)
 
         except (json.JSONDecodeError, KeyError) as error:
             self.get_logger().error(f'Invalid task plan: {error}')

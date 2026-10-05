@@ -34,6 +34,7 @@ setup(
             'task_executor = agent_robot.task_executor:main',
             'environment_node = agent_robot.environment_node:main',
             'vision_node = agent_robot.vision_node:main',
+            'scene_visualizer = agent_robot.scene_visualizer:main',
         ],
     },
 )
