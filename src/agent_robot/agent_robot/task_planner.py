@@ -26,9 +26,37 @@ class TaskPlanner(Node):
             10
         )
 
+        self.current_environment = {
+            'status': 'environment_not_received'
+        }
+
+        self.environment_received = False
+
+        self.environment_subscription = self.create_subscription(
+            String,
+            '/environment_state',
+            self.environment_callback,
+            10
+        )
+
         self.get_logger().info(
             'DeepSeek Task Planner node has started.'
         )
+
+    def environment_callback(self, msg):
+        try:
+            self.current_environment = json.loads(msg.data)
+
+            if not self.environment_received:
+                self.get_logger().info(
+                    'Environment state received.'
+                )
+                self.environment_received = True
+
+        except json.JSONDecodeError as error:
+            self.get_logger().error(
+                f'Invalid environment data: {error}'
+            )
 
     def command_callback(self, msg):
         command = msg.data
@@ -53,26 +81,53 @@ class TaskPlanner(Node):
             )
             return self.fallback_plan(command)
 
+        environment_text = json.dumps(
+            self.current_environment,
+            ensure_ascii=False,
+            indent=2
+        )
+
         prompt = f"""
-请将下面的用户命令拆分成机器人能够执行的动作步骤。
+        你是具身机器人的任务规划器。
 
-用户命令：{command}
+        请根据当前环境，判断用户任务是否可以执行。如果可以，
+        将任务拆分成机器人动作步骤。
 
-要求：
-1. 生成3到8个步骤。
-2. 每个步骤只描述一个明确动作。
-3. 步骤必须按照执行顺序排列。
-4. 不要输出解释。
-5. 严格输出下面格式的JSON：
+        用户命令：
+        {command}
 
-{{
-    "steps": [
-        "步骤1",
-        "步骤2",
-        "步骤3"
-    ]
-}}
-"""
+        机器人当前感知到的环境：
+        {environment_text}
+
+        判断规则：
+        1. 用户明确要求操作的物体必须存在于环境中。
+        2. 目标位置或目标容器必须存在于环境中。
+        3. 不得虚构环境中不存在的物体或位置。
+        4. 如果缺少必要物体，feasible必须为false，steps必须为空。
+        5. 如果可以执行，生成3到8个有序动作步骤。
+        6. 每个步骤只描述一个明确动作。
+        7. 不要输出JSON之外的解释。
+
+        严格输出以下JSON格式：
+
+        {{
+            "feasible": true,
+            "reason": "",
+            "steps": [
+                "步骤1",
+                "步骤2",
+                "步骤3"
+            ]
+        }}
+
+        不可执行时输出：
+
+        {{
+            "feasible": false,
+            "reason": "不可执行的具体原因",
+            "steps": []
+        }}
+        """
 
         request_data = {
             'model': 'deepseek-flash',
@@ -116,16 +171,29 @@ class TaskPlanner(Node):
 
             content = result['choices'][0]['message']['content']
             generated_plan = json.loads(content)
-            steps = generated_plan['steps']
 
-            if not isinstance(steps, list) or not steps:
-                raise ValueError('DeepSeek returned an empty plan.')
+            feasible = generated_plan.get('feasible', False)
+            reason = generated_plan.get('reason', '')
+            steps = generated_plan.get('steps', [])
+
+            if not isinstance(feasible, bool):
+                raise ValueError('Invalid feasible value.')
+
+            if not isinstance(steps, list):
+                raise ValueError('Invalid steps value.')
+
+            if feasible and not steps:
+                raise ValueError(
+                    'Feasible task must contain execution steps.'
+                )
 
             return {
                 'command': command,
+                'feasible': feasible,
+                'reason': reason,
                 'steps': steps,
                 'planner': 'deepseek',
-                'status': 'planned'
+                'status': 'planned' if feasible else 'rejected'
             }
 
         except urllib.error.HTTPError as error:
@@ -146,17 +214,12 @@ class TaskPlanner(Node):
     def fallback_plan(self, command):
         return {
             'command': command,
-            'steps': [
-                '分析用户任务',
-                '感知当前环境',
-                '确定目标对象的位置',
-                '执行相应机器人动作',
-                '检查任务执行结果'
-            ],
+            'feasible': False,
+            'reason': '任务规划服务暂时不可用，无法安全生成计划。',
+            'steps': [],
             'planner': 'fallback',
-            'status': 'planned'
+            'status': 'rejected'
         }
-
 
 def main(args=None):
     rclpy.init(args=args)

@@ -1,0 +1,27 @@
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package='agent_robot',
+            executable='environment_node',
+            name='environment_node',
+            output='screen'
+        ),
+
+        Node(
+            package='agent_robot',
+            executable='task_planner',
+            name='task_planner',
+            output='screen'
+        ),
+
+        Node(
+            package='agent_robot',
+            executable='task_executor',
+            name='task_executor',
+            output='screen'
+        )
+    ])

@@ -30,9 +30,30 @@ class TaskExecutor(Node):
         try:
             plan = json.loads(msg.data)
             command = plan['command']
-            steps = plan['steps']
+            steps = plan.get('steps', [])
+            feasible = plan.get('feasible', True)
+            reason = plan.get('reason', '')
 
             self.get_logger().info(f'Received task: {command}')
+
+            if not feasible:
+                self.get_logger().warning(
+                    f'Task rejected: {reason}'
+                )
+
+                rejected_status = {
+                    'command': command,
+                    'status': 'rejected',
+                    'reason': reason
+                }
+
+                rejected_msg = String()
+                rejected_msg.data = json.dumps(
+                    rejected_status,
+                    ensure_ascii=False
+                )
+                self.status_publisher.publish(rejected_msg)
+                return
 
             for index, step in enumerate(steps, start=1):
                 self.get_logger().info(
