@@ -7,7 +7,7 @@ package_name = 'agent_robot'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='0.1.0',
     packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -21,9 +21,12 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='deerainy',
-    maintainer_email='deerainy@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    maintainer_email='yuxinlu0410@gmail.com',
+    description=(
+        'Multimodal ROS 2 agent with visual perception, '
+        'LLM task planning and automatic replanning.'
+    ),
+    license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
