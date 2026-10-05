@@ -481,29 +481,6 @@ def build_skill_handlers(robot_id, object_table, state):
     }
 
 
-# ---------------------------------------------------------------------------
-# Compatibility wrappers for pybullet_bridge (removed in M1 phase 4)
-# ---------------------------------------------------------------------------
-
-def run_pick(robot_id, scene_objects):
-    """Deprecated wrapper: pick the apple. *scene_objects* is object_table."""
-    state = {'held_object': None, 'constraint_id': None}
-    pick_object(robot_id, scene_objects['apple'], state)
-    return state['constraint_id']
-
-
-def run_pick_and_place(robot_id, scene_objects):
-    """Deprecated wrapper: pick the apple and place it into the basket."""
-    state = {'held_object': None, 'constraint_id': None}
-    pick_object(robot_id, scene_objects['apple'], state)
-    place_object(
-        robot_id,
-        scene_objects['apple'],
-        scene_objects['basket'],
-        state
-    )
-
-
 def main():
     robot_id, object_table = create_scene()
 
