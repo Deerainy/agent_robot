@@ -43,6 +43,14 @@ class TaskPlanner(Node):
             'DeepSeek Task Planner node has started.'
         )
 
+        # 让规划器订阅执行状态
+        self.status_subscription = self.create_subscription(
+            String,
+            '/task_status',
+            self.status_callback,
+            10
+        )
+
     def environment_callback(self, msg):
         try:
             self.current_environment = json.loads(msg.data)
@@ -58,6 +66,65 @@ class TaskPlanner(Node):
                 f'Invalid environment data: {error}'
             )
 
+    # 增加失败反馈回调
+    def status_callback(self, msg):
+        try:
+            status_data = json.loads(msg.data)
+
+        except json.JSONDecodeError as error:
+            self.get_logger().error(
+                f'Invalid task status: {error}'
+            )
+            return
+
+        if status_data.get('status') != 'failed':
+            return
+
+        command = status_data.get('command', '')
+        failed_step = status_data.get(
+            'failed_step',
+            'unknown'
+        )
+        reason = status_data.get(
+            'reason',
+            'unknown reason'
+        )
+
+        self.get_logger().warning(
+            f'Execution failed at step: {failed_step}'
+        )
+        self.get_logger().info(
+            'Generating a revised plan with DeepSeek...'
+        )
+
+        failure_context = {
+            'failed_step': failed_step,
+            'reason': reason
+        }
+
+        revised_plan = self.generate_plan(
+            command,
+            failure_context=failure_context
+        )
+
+        revised_plan['command'] = command
+        revised_plan['replan_reason'] = reason
+
+        if revised_plan.get('feasible'):
+            revised_plan['status'] = 'replanned'
+
+        output_msg = String()
+        output_msg.data = json.dumps(
+            revised_plan,
+            ensure_ascii=False
+        )
+
+        self.publisher.publish(output_msg)
+
+        self.get_logger().info(
+            f'Published revised plan: {output_msg.data}'
+        )
+
     def command_callback(self, msg):
         command = msg.data
         self.get_logger().info(f'Received command: {command}')
@@ -71,7 +138,7 @@ class TaskPlanner(Node):
 
         self.get_logger().info(f'Published plan: {output_msg.data}')
 
-    def generate_plan(self, command):
+    def generate_plan(self, command, failure_context=None):
         api_key = os.environ.get('DEEPSEEK_API_KEY')
 
         if not api_key:
@@ -87,6 +154,15 @@ class TaskPlanner(Node):
             indent=2
         )
 
+        if failure_context:
+            failure_text = json.dumps(
+                failure_context,
+                ensure_ascii=False,
+                indent=2
+            )
+        else:
+            failure_text = '无，这是首次规划。'
+
         prompt = f"""
         你是具身机器人的任务规划器。
 
@@ -99,6 +175,9 @@ class TaskPlanner(Node):
         机器人当前感知到的环境：
         {environment_text}
 
+        此前执行失败信息：
+        {failure_text}
+
         判断规则：
         1. 用户明确要求操作的物体必须存在于环境中。
         2. 目标位置或目标容器必须存在于环境中。
@@ -107,6 +186,8 @@ class TaskPlanner(Node):
         5. 如果可以执行，生成3到8个有序动作步骤。
         6. 每个步骤只描述一个明确动作。
         7. 不要输出JSON之外的解释。
+        8. 如果存在此前失败信息，必须针对失败原因调整计划。
+        9. 新计划应避免原样重复导致失败的动作策略。
 
         严格输出以下JSON格式：
 

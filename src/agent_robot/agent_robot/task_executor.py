@@ -24,7 +24,25 @@ class TaskExecutor(Node):
             10
         )
 
+        self.failure_keyword = None
+
+        # 失败模拟订阅
+        self.failure_subscription = self.create_subscription(
+            String,
+            '/simulate_failure',
+            self.failure_callback,
+            10
+        )
+
         self.get_logger().info('Task Executor node has started.')
+
+    def failure_callback(self, msg):
+        self.failure_keyword = msg.data.strip()
+
+        self.get_logger().warning(
+            f'Next action containing "{self.failure_keyword}" '
+            'will be simulated as failed.'
+        )
 
     def plan_callback(self, msg):
         try:
@@ -56,37 +74,39 @@ class TaskExecutor(Node):
                 return
 
             for index, step in enumerate(steps, start=1):
+
+                if (
+                    self.failure_keyword
+                    and self.failure_keyword in step
+                ):
+                    failure_reason = (
+                        f'动作“{step}”执行失败：检测到模拟障碍。'
+                    )
+
+                    self.get_logger().error(failure_reason)
+
+                    failure_status = {
+                        'command': command,
+                        'status': 'failed',
+                        'failed_step': step,
+                        'step_index': index,
+                        'reason': failure_reason
+                    }
+
+                    failure_msg = String()
+                    failure_msg.data = json.dumps(
+                        failure_status,
+                        ensure_ascii=False
+                    )
+                    self.status_publisher.publish(failure_msg)
+
+                    # 只让这次动作失败，避免以后一直失败
+                    self.failure_keyword = None
+                    return
+
                 self.get_logger().info(
                     f'Executing step {index}/{len(steps)}: {step}'
                 )
-
-                status = {
-                    'command': command,
-                    'current_step': index,
-                    'total_steps': len(steps),
-                    'action': step,
-                    'status': 'executing'
-                }
-
-                status_msg = String()
-                status_msg.data = json.dumps(status, ensure_ascii=False)
-                self.status_publisher.publish(status_msg)
-
-                time.sleep(1)
-
-            completed_status = {
-                'command': command,
-                'status': 'completed'
-            }
-
-            completed_msg = String()
-            completed_msg.data = json.dumps(
-                completed_status,
-                ensure_ascii=False
-            )
-            self.status_publisher.publish(completed_msg)
-
-            self.get_logger().info('Task completed.')
 
         except (json.JSONDecodeError, KeyError) as error:
             self.get_logger().error(f'Invalid task plan: {error}')
