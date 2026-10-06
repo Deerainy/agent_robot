@@ -5,15 +5,29 @@ import urllib.request
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
 from std_msgs.msg import String
 
-from agent_robot.skill_registry import (
-    ActionSchemaError,
-    parse_actions,
-    skill_catalog_text,
+from agent_robot.plan_validator import (
+    build_validation_feedback,
+    evaluate_generated_plan,
 )
+from agent_robot.scene_graph import SceneGraph
+from agent_robot.skill_registry import skill_catalog_text
 
-SCHEMA_VERSION = '2.0'
+SCHEMA_VERSION = '2.1'
+
+# Must match task_executor's publisher profile: the planner subscribes to the
+# latched authoritative scene graph.
+SCENE_GRAPH_QOS = QoSProfile(
+    depth=1,
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 class TaskPlanner(Node):
@@ -35,6 +49,13 @@ class TaskPlanner(Node):
             10
         )
 
+        self.scene_graph_subscription = self.create_subscription(
+            String,
+            '/scene_graph',
+            self.scene_graph_callback,
+            SCENE_GRAPH_QOS
+        )
+
         self.status_subscription = self.create_subscription(
             String,
             '/task_status',
@@ -53,6 +74,8 @@ class TaskPlanner(Node):
             'objects': []
         }
         self.environment_received = False
+        self.scene_graph_received = False
+        self.latest_scene_graph = None
         self.replan_counts = {}
 
         self.get_logger().info('DeepSeek Task Planner node has started.')
@@ -71,6 +94,24 @@ class TaskPlanner(Node):
         if not self.environment_received:
             self.get_logger().info('Environment state received.')
             self.environment_received = True
+
+    def scene_graph_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self.latest_scene_graph = SceneGraph.from_dict(data)
+        except (json.JSONDecodeError, ValueError) as error:
+            self.get_logger().error(
+                'Invalid scene graph data: {}'.format(error)
+            )
+            return
+
+        if not self.scene_graph_received:
+            self.get_logger().info(
+                'Scene graph received from executor (source={}).'.format(
+                    self.latest_scene_graph.source
+                )
+            )
+            self.scene_graph_received = True
 
     def status_callback(self, msg):
         try:
@@ -140,6 +181,37 @@ class TaskPlanner(Node):
 
         self.get_logger().info('Published plan: {}'.format(message.data))
 
+    # ------------------------------------------------------------------
+    # Planning
+    # ------------------------------------------------------------------
+
+    def _validation_graph(self):
+        """Choose the start graph for plan-time validation.
+
+        Priority: latest executor graph (authoritative) -> a graph built
+        from the current perception payload -> ``None`` (skip validation;
+        catalog defaults must never masquerade as perception here).
+        """
+        if self.latest_scene_graph is not None:
+            return self.latest_scene_graph.clone()
+
+        if self.current_environment.get('objects'):
+            return SceneGraph.build_from_environment(
+                self.current_environment
+            )
+
+        return None
+
+    def _grounding_names(self, graph):
+        names = self._environment_object_names()
+
+        if graph is not None:
+            for name in graph.objects:
+                if name not in names:
+                    names.append(name)
+
+        return names
+
     def generate_plan(self, command, failure_context=None):
         api_key = os.environ.get('DEEPSEEK_API_KEY')
 
@@ -149,15 +221,6 @@ class TaskPlanner(Node):
                 'Using fallback rejection.'
             )
             return self.fallback_plan(command)
-
-        environment_text = json.dumps(
-            self.current_environment,
-            ensure_ascii=False,
-            indent=2
-        )
-
-        object_names = self._environment_object_names()
-        object_text = ', '.join(object_names) or '(environment is empty)'
 
         if failure_context:
             failure_text = json.dumps(
@@ -173,59 +236,123 @@ class TaskPlanner(Node):
             failure_text = '无，这是首次规划。'
             replans = 0
 
-        prompt = """
-你是具身机器人的任务规划器，必须把自然语言任务编译成结构化机器人技能序列。
-
-用户命令：
-{command}
-
-机器人当前感知到的环境：
-{environment_text}
-
-环境中可引用的物体名称（object/target 只能取这些英文名）：
-{object_text}
-
-{skill_catalog}
-
-此前执行失败信息（若有，必须针对失败动作和原因调整，避免原样重试）：
-{failure_text}
-
-规划规则：
-1. 用户明确要求操作的物体与目标容器必须出现在环境物体名称中，严禁虚构。
-2. actions 中的 skill 只能使用上面目录列出的 3 个技能；严禁输出
-   open_gripper、close_gripper 等内部原语或任何其他动词。
-3. 每个动作只引用一个物体；place 必须同时给出 object 与 target。
-4. 典型顺序为 move_to(物体) -> pick(物体) -> move_to(目标) ->
-   place(物体, 目标)；根据任务需要生成 2 到 6 个动作，不得有冗余动作。
-5. 缺少必要物体或目标时，feasible 必须为 false，actions 必须为空数组。
-6. 只输出 JSON，不要输出 JSON 之外的任何解释或 Markdown 代码块。
-
-可执行时严格输出：
-{{
-    "feasible": true,
-    "reason": "",
-    "actions": [
-        {{"skill": "move_to", "object": "物体英文名"}},
-        {{"skill": "pick", "object": "物体英文名"}},
-        {{"skill": "move_to", "object": "目标英文名"}},
-        {{"skill": "place", "object": "物体英文名", "target": "目标英文名"}}
-    ]
-}}
-
-不可执行时严格输出：
-{{
-    "feasible": false,
-    "reason": "不可执行的具体原因",
-    "actions": []
-}}
-""".format(
-            command=command,
-            environment_text=environment_text,
-            object_text=object_text,
-            skill_catalog=skill_catalog_text(),
-            failure_text=failure_text
+        graph = self._validation_graph()
+        env_names = self._grounding_names(graph)
+        object_text = ', '.join(env_names) or '(environment is empty)'
+        scene_text = (
+            graph.to_prompt_text()
+            if graph is not None
+            else '（暂无场景图：跳过序列级前置验证，执行器仍会逐动作验证）'
         )
 
+        try:
+            content = self._call_deepseek(
+                self._build_prompt(
+                    command,
+                    object_text,
+                    scene_text,
+                    failure_text,
+                    validation_text='无，这是首次生成。'
+                )
+            )
+            generated_plan = json.loads(content)
+        except urllib.error.HTTPError as error:
+            error_message = error.read().decode('utf-8')
+            self.get_logger().error(
+                'DeepSeek HTTP error {}: {}'.format(
+                    error.code, error_message
+                )
+            )
+            return self.fallback_plan(command, replans=replans)
+        except Exception as error:
+            self.get_logger().error(
+                'DeepSeek planning failed: {}'.format(error)
+            )
+            return self.fallback_plan(command, replans=replans)
+
+        evaluation = evaluate_generated_plan(
+            generated_plan, env_names, graph
+        )
+
+        # Exactly one self-repair attempt, and only when a graph exists to
+        # validate the repaired output against.
+        if evaluation.repairable and graph is not None:
+            self.get_logger().warning(
+                'Generated plan failed validation at {}: {}: {}. '
+                'Requesting one self-repair.'.format(
+                    evaluation.error_stage,
+                    evaluation.error_code,
+                    evaluation.error_detail
+                )
+            )
+
+            validation_text = build_validation_feedback(evaluation, graph)
+
+            try:
+                repaired_content = self._call_deepseek(
+                    self._build_prompt(
+                        command,
+                        object_text,
+                        scene_text,
+                        failure_text,
+                        validation_text=validation_text
+                    )
+                )
+                repaired_plan = json.loads(repaired_content)
+            except urllib.error.HTTPError as error:
+                error_message = error.read().decode('utf-8')
+                self.get_logger().error(
+                    'DeepSeek repair HTTP error {}: {}'.format(
+                        error.code, error_message
+                    )
+                )
+                return self.fallback_plan(command, replans=replans)
+            except Exception as error:
+                self.get_logger().error(
+                    'DeepSeek repair failed: {}'.format(error)
+                )
+                return self.fallback_plan(command, replans=replans)
+
+            evaluation = evaluate_generated_plan(
+                repaired_plan, env_names, graph
+            )
+
+        if evaluation.feasible and evaluation.accepted:
+            return {
+                'command': command,
+                'schema_version': SCHEMA_VERSION,
+                'feasible': True,
+                'reason': evaluation.reason,
+                'actions': evaluation.actions,
+                'planner': 'deepseek',
+                'status': 'planned',
+                'replans': replans
+            }
+
+        if evaluation.feasible:
+            # The model produced something, but it is still unsafe after
+            # the one allowed repair: reject without publishing bad actions.
+            reason = 'plan_validation_failed: {}: {}{}'.format(
+                evaluation.error_stage or 'validation',
+                evaluation.error_code,
+                evaluation.error_detail
+            )
+            self.get_logger().error(
+                'Generated plan rejected by validation: {}'.format(reason)
+            )
+            return self._rejected_plan(
+                command, reason, replans=replans, planner='plan_validator'
+            )
+
+        return self._rejected_plan(
+            command,
+            evaluation.reason,
+            replans=replans,
+            planner='deepseek'
+        )
+
+    def _call_deepseek(self, prompt):
+        """Perform one chat-completion API call; return content string."""
         request_data = {
             'model': 'deepseek-flash',
             'messages': [
@@ -252,73 +379,98 @@ class TaskPlanner(Node):
             data=json.dumps(request_data).encode('utf-8'),
             headers={
                 'Content-Type': 'application/json',
-                'Authorization': 'Bearer {}'.format(api_key)
+                'Authorization': 'Bearer {}'.format(
+                    os.environ.get('DEEPSEEK_API_KEY')
+                )
             },
             method='POST'
         )
 
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                result = json.loads(response.read().decode('utf-8'))
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode('utf-8'))
 
-            content = result['choices'][0]['message']['content']
-            generated_plan = json.loads(content)
+        return result['choices'][0]['message']['content']
 
-            feasible = generated_plan.get('feasible', False)
-            reason = generated_plan.get('reason', '')
-            raw_actions = generated_plan.get('actions', [])
+    def _build_prompt(
+        self,
+        command,
+        object_text,
+        scene_text,
+        failure_text,
+        validation_text
+    ):
+        return """
+你是具身机器人的任务规划器，必须把自然语言任务编译成结构化机器人技能序列。
 
-            if not isinstance(feasible, bool):
-                raise ValueError('Invalid feasible value.')
+用户命令：
+{command}
 
-            if not isinstance(raw_actions, list):
-                raise ValueError('Invalid actions value.')
+机器人当前感知到的环境：
+{environment_text}
 
-            if feasible:
-                actions = [
-                    action.to_dict()
-                    for action in parse_actions(raw_actions)
-                ]
-                status = 'planned'
-            else:
-                if raw_actions:
-                    raise ValueError(
-                        'Infeasible plan must contain empty actions.'
-                    )
-                actions = []
-                status = 'rejected'
+环境中可引用的物体名称（object/target 只能取这些英文名）：
+{object_text}
 
-            return {
-                'command': command,
-                'schema_version': SCHEMA_VERSION,
-                'feasible': feasible,
-                'reason': reason,
-                'actions': actions,
-                'planner': 'deepseek',
-                'status': status,
-                'replans': replans
-            }
+{skill_catalog}
 
-        except ActionSchemaError as error:
-            self.get_logger().error(
-                'Generated actions violate the skill protocol: {}'.format(
-                    error
-                )
-            )
-        except urllib.error.HTTPError as error:
-            error_message = error.read().decode('utf-8')
-            self.get_logger().error(
-                'DeepSeek HTTP error {}: {}'.format(
-                    error.code, error_message
-                )
-            )
-        except Exception as error:
-            self.get_logger().error(
-                'DeepSeek planning failed: {}'.format(error)
-            )
+场景图（符号世界状态，动作序列必须满足前置条件）：
+{scene_text}
 
-        self.get_logger().warning('Using fallback rejection.')
-        return self.fallback_plan(command, replans=replans)
+此前执行失败信息（若有，必须针对失败动作和原因调整，避免原样重试）：
+{failure_text}
+
+上一版计划的自动验证反馈：
+{validation_text}
+
+规划规则：
+1. 用户明确要求操作的物体与目标容器必须出现在环境物体名称中，严禁虚构。
+2. actions 中的 skill 只能使用上面目录列出的 3 个技能；严禁输出
+   open_gripper、close_gripper 等内部原语或任何其他动词。
+3. 每个动作只引用一个物体；place 必须同时给出 object 与 target。
+4. 技能前置条件（违反会被执行器拒绝，且不会产生任何运动）：
+   - move_to(x) 仅要求 x 是场景中的可操作物体，语义为移动到 x 上方；
+   - pick(x) 前必须先有针对同一 x 的 move_to(x)，x 必须可抓取，
+     且夹爪必须为空；pick 内部自行完成张爪、下降、闭合与抬升；
+   - place(x, t) 前必须正握持 x、且已有针对 t 的 move_to(t)，
+     t 必须是容器或支撑面；place 内部自行完成下降、释放与撤离；
+   - basket 是容器，只能作为 place 的 target，严禁 pick(basket)。
+5. 典型顺序为 move_to(物体) -> pick(物体) -> move_to(目标) ->
+   place(物体, 目标)；根据任务需要生成 2 到 6 个动作，不得有冗余动作。
+6. 缺少必要物体或目标时，feasible 必须为 false，actions 必须为空数组。
+7. 若存在自动验证反馈，必须先解决其中指出的违例动作，严禁原样重试。
+8. 只输出 JSON，不要输出 JSON 之外的任何解释或 Markdown 代码块。
+
+可执行时严格输出：
+{{
+    "feasible": true,
+    "reason": "",
+    "actions": [
+        {{"skill": "move_to", "object": "物体英文名"}},
+        {{"skill": "pick", "object": "物体英文名"}},
+        {{"skill": "move_to", "object": "目标英文名"}},
+        {{"skill": "place", "object": "物体英文名", "target": "目标英文名"}}
+    ]
+}}
+
+不可执行时严格输出：
+{{
+    "feasible": false,
+    "reason": "不可执行的具体原因",
+    "actions": []
+}}
+""".format(
+            command=command,
+            environment_text=json.dumps(
+                self.current_environment,
+                ensure_ascii=False,
+                indent=2
+            ),
+            object_text=object_text,
+            skill_catalog=skill_catalog_text(),
+            scene_text=scene_text,
+            failure_text=failure_text,
+            validation_text=validation_text
+        )
 
     def _environment_object_names(self):
         names = []
@@ -331,17 +483,25 @@ class TaskPlanner(Node):
 
         return names
 
-    def fallback_plan(self, command, replans=0):
+    def _rejected_plan(self, command, reason, replans=0, planner='fallback'):
         return {
             'command': command,
             'schema_version': SCHEMA_VERSION,
             'feasible': False,
-            'reason': '任务规划服务暂时不可用或输出不合法，无法安全生成计划。',
+            'reason': reason,
             'actions': [],
-            'planner': 'fallback',
+            'planner': planner,
             'status': 'rejected',
             'replans': replans
         }
+
+    def fallback_plan(self, command, replans=0):
+        return self._rejected_plan(
+            command,
+            '任务规划服务暂时不可用或输出不合法，无法安全生成计划。',
+            replans=replans,
+            planner='fallback'
+        )
 
 
 def main(args=None):

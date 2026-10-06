@@ -1,10 +1,13 @@
 """Task executor: the single authority for structured skill execution.
 
-Responsibilities (M1):
+Responsibilities (M2):
 
 - consume schema-v2 plans (``actions`` list) from ``/task_plan``;
 - ground action parameters against the latest ``/environment_state``;
-- validate actions through :mod:`agent_robot.skill_registry`;
+- hold the authoritative :class:`~agent_robot.scene_graph.SceneGraph`
+  and enforce skill preconditions both for the whole plan (before any
+  motion) and per action (against the live graph);
+- publish world-state updates on the latched ``/scene_graph`` topic;
 - inject simulated failures from ``/simulate_failure``;
 - publish the five execution states on ``/task_status``:
   ``action_started`` / ``action_completed`` / ``failed`` /
@@ -14,120 +17,40 @@ Responsibilities (M1):
 
 import hashlib
 import json
-import re
 import time
-from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
 from std_msgs.msg import String
 
+from agent_robot.scene_graph import (
+    GroundingError,
+    SOURCE_EXECUTION,
+    SceneGraph,
+    ground_action,
+    ground_name,
+    validate_actions,
+)
 from agent_robot.skill_registry import (
     ActionSchemaError,
-    SkillAction,
     SkillExecutionError,
     SkillRegistry,
     parse_actions,
 )
 
 
-# Object names the simulated scene physically knows about.
-CANONICAL_OBJECTS = ('apple', 'cup', 'basket')
-
-_COLOR_WORDS = {
-    'red', 'blue', 'brown', 'green', 'yellow',
-    'black', 'white', 'orange', 'purple', 'gray', 'grey'
-}
-
-_CHINESE_ALIASES = {
-    '苹果': 'apple',
-    '篮子': 'basket',
-    '篮筐': 'basket',
-    '杯子': 'cup',
-    '水杯': 'cup',
-}
-
-
-def semantic_tokens(text):
-    # type: (str) -> List[str]
-    """Extract color-free semantic tokens from an object name."""
-    if text in _CHINESE_ALIASES:
-        return [_CHINESE_ALIASES[text]]
-
-    tokens = re.findall(r'[a-z0-9]+', text.lower())
-    return [token for token in tokens if token not in _COLOR_WORDS]
-
-
-def ground_name(query, env_names):
-    # type: (str, List[str]) -> Optional[str]
-    """Map an action parameter to a canonical scene object name.
-
-    Matching order: normalized exact match, then semantic token overlap
-    (color adjectives are ignored, so ``red_apple`` grounds ``apple``).
-    Returns ``None`` when no environment object supports the query or the
-    result is not a physically available object.
-    """
-    if not isinstance(query, str) or not query.strip():
-        return None
-
-    normalized_query = query.strip().lower()
-
-    if normalized_query in _CHINESE_ALIASES:
-        canonical = _CHINESE_ALIASES[normalized_query]
-        if canonical in CANONICAL_OBJECTS:
-            return canonical
-        return None
-
-    query_tokens = semantic_tokens(normalized_query)
-
-    matched_env_name = None
-
-    for env_name in env_names:
-        normalized_env = env_name.strip().lower()
-
-        if normalized_query == normalized_env:
-            matched_env_name = normalized_env
-            break
-
-        env_tokens = semantic_tokens(normalized_env)
-
-        if query_tokens and set(query_tokens) & set(env_tokens):
-            matched_env_name = normalized_env
-            break
-
-    if matched_env_name is None:
-        # The environment may be missing while the query itself is a
-        # canonical scene name (debugging / mock scenarios).
-        matched_env_name = normalized_query
-
-    for token in semantic_tokens(matched_env_name):
-        if token in CANONICAL_OBJECTS:
-            return token
-
-    return None
-
-
-def ground_action(action, env_names):
-    # type: (SkillAction, List[str]) -> SkillAction
-    """Return a copy of *action* with grounded canonical object names."""
-    grounded = {}
-
-    for param_name, value in action.params.items():
-        canonical = ground_name(value, env_names)
-
-        if canonical is None:
-            raise GroundingError(
-                'Cannot ground {} parameter "{}" against scene objects: '
-                '{}'.format(action.skill, param_name, value)
-            )
-
-        grounded[param_name] = canonical
-
-    return SkillAction(skill=action.skill, params=grounded)
-
-
-class GroundingError(ValueError):
-    """An action parameter cannot be mapped to a scene object."""
+# Latched so planners/subscribers started after the executor immediately
+# receive the latest world state (M2).
+SCENE_GRAPH_QOS = QoSProfile(
+    depth=1,
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 class MockSkillBackend(object):
@@ -254,10 +177,22 @@ class TaskExecutor(Node):
             10
         )
 
+        self.graph_publisher = self.create_publisher(
+            String,
+            '/scene_graph',
+            SCENE_GRAPH_QOS
+        )
+
         self.current_environment = {
             'status': 'environment_not_received',
             'objects': []
         }
+
+        # Authoritative symbolic world state. The fixed catalog scene is
+        # valid for the mock backend and the fixed PyBullet scene until real
+        # perception arrives; it must never masquerade as perception.
+        self.scene_graph = SceneGraph.build_default()
+
         self.executing = False
         self.pending_failure = None
         self.last_plan_hash = None
@@ -265,6 +200,11 @@ class TaskExecutor(Node):
         self.get_logger().info(
             'Task Executor started (backend={}).'.format(backend_name)
         )
+        self.get_logger().info(
+            'Scene graph initialized from catalog defaults (backend={}); '
+            'waiting for perception.'.format(backend_name)
+        )
+        self._publish_scene_graph()
 
     # ------------------------------------------------------------------
     # Subscriptions
@@ -286,11 +226,20 @@ class TaskExecutor(Node):
             return
 
         self.current_environment = environment
+        self.scene_graph = SceneGraph.build_from_environment(environment)
+
         self.get_logger().info(
             'Environment state received with {} object(s).'.format(
                 len(environment['objects'])
             )
         )
+
+        for warning in self.scene_graph.warnings:
+            self.get_logger().warning(
+                'Scene graph builder warning: {}'.format(warning)
+            )
+
+        self._publish_scene_graph()
 
     def failure_callback(self, msg):
         payload = msg.data.strip()
@@ -401,6 +350,28 @@ class TaskExecutor(Node):
                 )
                 return
 
+        # Whole-sequence validation against the current authoritative
+        # graph: an infeasible sequence fails before any motion starts.
+        report = validate_actions(grounded_actions, self.scene_graph)
+
+        if not report.ok:
+            violation = report.violation
+            reason = 'precondition_violation: {}: {}'.format(
+                violation.reason_code, violation.detail
+            )
+            self.get_logger().error(
+                'Plan rejected before execution: {}'.format(reason)
+            )
+            self._publish_status(
+                command=command,
+                status='failed',
+                action=violation.action,
+                index=violation.index + 1,
+                total=len(grounded_actions),
+                reason=reason
+            )
+            return
+
         self.executing = True
 
         try:
@@ -426,6 +397,27 @@ class TaskExecutor(Node):
         total = len(actions)
 
         for index, action in enumerate(actions, start=1):
+            # Runtime precondition re-check against the live graph: never
+            # start a motion whose preconditions are not satisfied.
+            violation = self.scene_graph.check_preconditions(action)
+
+            if violation is not None:
+                reason_code, detail = violation
+                reason = 'precondition_violation: {}: {}'.format(
+                    reason_code, detail
+                )
+                self.get_logger().error(reason)
+                self._publish_status(
+                    command=command,
+                    status='failed',
+                    action=action,
+                    index=index,
+                    total=total,
+                    reason=reason
+                )
+                self._publish_scene_graph()
+                return
+
             if self._failure_matches(action):
                 reason = (
                     '动作 {} 执行失败：注入的模拟故障。'.format(
@@ -442,6 +434,9 @@ class TaskExecutor(Node):
                     reason=reason
                 )
                 self.pending_failure = None
+                # No effect is applied on failure; publish the unchanged
+                # graph so planners see the true failure-time state.
+                self._publish_scene_graph()
                 return
 
             self._publish_status(
@@ -473,7 +468,12 @@ class TaskExecutor(Node):
                     total=total,
                     reason=reason
                 )
+                self._publish_scene_graph()
                 return
+
+            # Only a physically completed action advances the world state.
+            self.scene_graph.apply(action)
+            self.scene_graph.source = SOURCE_EXECUTION
 
             self._publish_status(
                 command=command,
@@ -482,6 +482,7 @@ class TaskExecutor(Node):
                 index=index,
                 total=total
             )
+            self._publish_scene_graph()
 
         self._publish_status(
             command=command,
@@ -490,6 +491,14 @@ class TaskExecutor(Node):
             reason='All {} action(s) completed.'.format(total)
         )
         self.get_logger().info('Task succeeded: {}'.format(command))
+
+    def _publish_scene_graph(self):
+        message = String()
+        message.data = json.dumps(
+            self.scene_graph.to_dict(),
+            ensure_ascii=False
+        )
+        self.graph_publisher.publish(message)
 
     def _get_backend(self):
         if self._backend is not None:
