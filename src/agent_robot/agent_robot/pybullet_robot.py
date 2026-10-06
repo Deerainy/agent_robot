@@ -20,6 +20,7 @@ from typing import List, Optional
 import pybullet as p
 import pybullet_data
 
+from agent_robot.scene_graph import OBJECT_CATALOG
 from agent_robot.skill_registry import (
     SkillExecutionError,
     SkillRegistry,
@@ -47,6 +48,7 @@ class ObjectSpec:
     place_release_position: Optional[List[float]] = None
     place_rest_position: Optional[List[float]] = None
     graspable: bool = True
+    receptacle: Optional[str] = None
 
 
 def create_box(position, half_extents, color):
@@ -166,7 +168,9 @@ def create_scene(connection_mode=p.GUI):
         body_id=apple_id,
         position=list(apple_position),
         above_position=[0.55, -0.20, 0.32],
-        grasp_position=[0.55, -0.20, 0.085]
+        grasp_position=[0.55, -0.20, 0.085],
+        graspable=OBJECT_CATALOG['apple'].graspable,
+        receptacle=OBJECT_CATALOG['apple'].receptacle
     )
 
     # Blue cup.
@@ -203,7 +207,9 @@ def create_scene(connection_mode=p.GUI):
         body_id=cup_id,
         position=list(cup_position),
         above_position=[0.55, 0.05, 0.32],
-        grasp_position=[0.55, 0.05, 0.085]
+        grasp_position=[0.55, 0.05, 0.085],
+        graspable=OBJECT_CATALOG['cup'].graspable,
+        receptacle=OBJECT_CATALOG['cup'].receptacle
     )
 
     # Brown basket (base + four walls).
@@ -223,7 +229,8 @@ def create_scene(connection_mode=p.GUI):
         grasp_position=None,
         place_release_position=[0.70, 0.28, 0.14],
         place_rest_position=[0.70, 0.28, 0.105],
-        graspable=False
+        graspable=OBJECT_CATALOG['basket'].graspable,
+        receptacle=OBJECT_CATALOG['basket'].receptacle
     )
 
     return robot_id, object_table
