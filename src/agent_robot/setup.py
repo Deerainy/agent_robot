@@ -1,6 +1,6 @@
 import os
 from glob import glob
-from setuptools import find_packages, setup
+from setuptools import setup
 
 
 package_name = 'agent_robot'
@@ -40,7 +40,6 @@ setup(
             'vision_node = agent_robot.vision_node:main',
             'scene_visualizer = agent_robot.scene_visualizer:main',
             'scene_loader = agent_robot.scene_loader:main',
-            'pybullet_bridge = agent_robot.pybullet_bridge:main',
         ],
     },
 )
