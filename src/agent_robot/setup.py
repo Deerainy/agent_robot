@@ -41,6 +41,7 @@ setup(
             'scene_visualizer = agent_robot.scene_visualizer:main',
             'scene_loader = agent_robot.scene_loader:main',
             'trajectory_recorder = agent_robot.trajectory_recorder:main',
+            'score_trajectories = agent_robot.quality_scorer:main',
         ],
     },
 )
