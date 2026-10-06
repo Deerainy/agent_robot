@@ -54,4 +54,11 @@ def generate_launch_description():
             name='scene_loader',
             output='screen'
         ),
+
+        Node(
+            package='agent_robot',
+            executable='trajectory_recorder',
+            name='trajectory_recorder',
+            output='screen'
+        ),
     ])
