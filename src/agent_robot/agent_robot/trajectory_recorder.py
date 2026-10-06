@@ -94,6 +94,10 @@ class TrajectoryRecorder(Node):
             self.write_run(run)
 
     def write_run(self, run):
+        # Recreate the output dir if it disappeared mid-run: the recorder
+        # is long-lived and must survive external cleanup of its output.
+        os.makedirs(self.output_dir, exist_ok=True)
+
         path = os.path.join(
             self.output_dir, '{}.json'.format(run['run_id'])
         )
