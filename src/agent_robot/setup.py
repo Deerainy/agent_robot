@@ -44,6 +44,7 @@ setup(
             'trajectory_recorder = agent_robot.trajectory_recorder:main',
             'score_trajectories = agent_robot.quality_scorer:main',
             'run_experiments = agent_robot.experiments.batch_runner:main',
+            'run_baseline = agent_robot.experiments.baseline_runner:main',
         ],
     },
 )

@@ -231,18 +231,56 @@ def launch_stack(workspace, task_tmp_dir, mode):
     )
 
 
+def _descendant_pids(pid):
+    # type: (int) -> list
+    """Return all descendant PIDs of *pid* by walking /proc."""
+    children = []
+
+    try:
+        with open('/proc/{0}/task/{0}/children'.format(pid)) as handle:
+            children = [int(x) for x in handle.read().split()]
+    except (OSError, ValueError):
+        return []
+
+    descendants = list(children)
+
+    for child in children:
+        descendants.extend(_descendant_pids(child))
+
+    return descendants
+
+
 def stop_stack(process):
     # type: (subprocess.Popen) -> None
+    """Stop a launched stack and every process it spawned.
+
+    ``ros2 launch`` / ``ros2 run`` create nested process groups and may
+    reparent node processes; the bash wrapper can exit before its
+    grandchildren.  We therefore collect every descendant PID first,
+    signal them all, and SIGKILL any survivors.
+    """
     if process.poll() is not None:
         return
 
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGINT)
-        process.wait(timeout=SHUTDOWN_WAIT_SECONDS)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+    targets = [process.pid] + _descendant_pids(process.pid)
+
+    for pid in targets:
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except ProcessLookupError:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            pass
+
+    try:
+        process.wait(timeout=SHUTDOWN_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+    survivors = [process.pid] + _descendant_pids(process.pid)
+
+    for pid in survivors:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
             pass
 
 
