@@ -8,7 +8,8 @@ package_name = 'agent_robot'
 setup(
     name=package_name,
     version='0.1.0',
-    packages=[package_name],
+    packages=[package_name, package_name + '.experiments'],
+    package_data={package_name + '.experiments': ['*.json']},
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -42,6 +43,9 @@ setup(
             'scene_loader = agent_robot.scene_loader:main',
             'trajectory_recorder = agent_robot.trajectory_recorder:main',
             'score_trajectories = agent_robot.quality_scorer:main',
+            'run_experiments = agent_robot.experiments.batch_runner:main',
+            'run_baseline = agent_robot.experiments.baseline_runner:main',
+            'report_experiments = agent_robot.experiments.report:main',
         ],
     },
 )
