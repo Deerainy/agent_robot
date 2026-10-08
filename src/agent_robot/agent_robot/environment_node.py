@@ -4,6 +4,8 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from agent_robot.ros_qos import ENVIRONMENT_STATE_QOS
+
 
 class EnvironmentNode(Node):
 
@@ -13,7 +15,7 @@ class EnvironmentNode(Node):
         self.publisher = self.create_publisher(
             String,
             '/environment_state',
-            10
+            ENVIRONMENT_STATE_QOS
         )
 
         self.timer = self.create_timer(

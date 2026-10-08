@@ -127,9 +127,16 @@ def evaluate_generated_plan(generated, env_names, graph):
 
     grounded_actions = []
 
+    # M5: when a scene graph is available, ground against its instances
+    # (unique resolution; ambiguity lists candidates). The legacy path
+    # grounds against raw perceived names when no graph exists yet.
+    grounding_basis = graph if graph is not None else env_names
+
     for index, action in enumerate(parsed_actions):
         try:
-            grounded_actions.append(ground_action(action, env_names))
+            grounded_actions.append(
+                ground_action(action, grounding_basis)
+            )
         except GroundingError as error:
             return PlanEvaluation(
                 feasible=True,

@@ -18,6 +18,7 @@ from rclpy.qos import (
 )
 from std_msgs.msg import String
 
+from agent_robot.ros_qos import ENVIRONMENT_STATE_QOS
 from agent_robot.trajectory import RunBuilder
 
 # Must match task_executor's publisher profile: the recorder subscribes
@@ -49,6 +50,18 @@ class TrajectoryRecorder(Node):
         )
         self.create_subscription(
             String, '/scene_graph', self.graph_callback, SCENE_GRAPH_QOS
+        )
+        self.create_subscription(
+            String,
+            '/environment_state',
+            self.environment_callback,
+            ENVIRONMENT_STATE_QOS,
+        )
+        self.create_subscription(
+            String, '/world_event', self.world_event_callback, 10
+        )
+        self.create_subscription(
+            String, '/trajectory_point', self.trajectory_callback, 10
         )
 
         # Drains terminal runs after the final-graph wait and idle-timeout
@@ -83,6 +96,30 @@ class TrajectoryRecorder(Node):
         except json.JSONDecodeError as error:
             self.get_logger().error(
                 'Invalid scene graph JSON: {}'.format(error)
+            )
+
+    def environment_callback(self, msg):
+        try:
+            self.builder.on_environment(json.loads(msg.data))
+        except json.JSONDecodeError as error:
+            self.get_logger().error(
+                'Invalid environment JSON: {}'.format(error)
+            )
+
+    def world_event_callback(self, msg):
+        try:
+            self.builder.on_world_event(json.loads(msg.data))
+        except json.JSONDecodeError as error:
+            self.get_logger().error(
+                'Invalid world event JSON: {}'.format(error)
+            )
+
+    def trajectory_callback(self, msg):
+        try:
+            self.builder.on_trajectory_point(json.loads(msg.data))
+        except json.JSONDecodeError as error:
+            self.get_logger().error(
+                'Invalid trajectory point JSON: {}'.format(error)
             )
 
     # ------------------------------------------------------------------

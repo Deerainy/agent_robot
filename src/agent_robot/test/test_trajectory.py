@@ -167,6 +167,156 @@ def test_failed_then_replan_merges_into_single_run():
     assert len(run['events']) == 4
 
 
+def test_grasp_failure_replan_records_recovery_fields():
+    builder, clock, mono = make_builder()
+    builder.on_plan(plan())
+    builder.on_status(status(
+        'failed',
+        reason='grasp failed',
+        failure_code='grasp_failed',
+        action={'skill': 'pick', 'params': {'object': 'apple'}},
+        step_index=2,
+    ))
+    builder.on_plan(dict(
+        plan(replans=1),
+        status='replanned',
+    ))
+    builder.on_status(status('succeeded'))
+
+    mono.advance(FINAL_GRAPH_WAIT + 0.01)
+    run = builder.pop_ready_runs()[0]
+
+    assert run['failures'][0]['failure_code'] == 'grasp_failed'
+    assert run['replans'] == 1
+    assert run['recovered'] is True
+
+
+def test_run_records_scenario_revision_and_world_event_context():
+    builder, clock, mono = make_builder()
+    builder.on_environment({
+        'scenario_id': 'recovery_seed7',
+        'category': 'recovery',
+        'seed': 7,
+        'world_revision': 0,
+    })
+    builder.on_plan(plan())
+    action = {
+        'skill': 'move_to',
+        'params': {'object': 'apple'},
+    }
+    builder.on_status(status(
+        'action_started',
+        action=action,
+        step_index=1,
+        world_revision=0,
+    ))
+    builder.on_environment({
+        'scenario_id': 'recovery_seed7',
+        'category': 'recovery',
+        'seed': 7,
+        'world_revision': 1,
+    })
+    builder.on_environment({
+        'scenario_id': 'recovery_seed7',
+        'category': 'recovery',
+        'seed': 7,
+        'world_revision': 1,
+    })
+    builder.on_world_event({
+        'revision': 1,
+        'event': 'object_slide',
+        'target': 'apple',
+    })
+    builder.on_status(status(
+        'action_completed',
+        action=action,
+        step_index=1,
+        world_revision=1,
+    ))
+    builder.on_status(
+        status('failed', reason='stale_plan: object_not_in_scene')
+    )
+    builder.on_plan(plan(replans=1))
+    builder.on_status(status('succeeded'))
+
+    mono.advance(FINAL_GRAPH_WAIT + 0.01)
+    run = builder.pop_ready_runs()[0]
+
+    assert run['scenario'] == {
+        'scenario_id': 'recovery_seed7',
+        'category': 'recovery',
+        'seed': 7,
+    }
+    assert run['world_revisions'] == [0, 1]
+    assert run['action_revisions'] == [
+        {
+            'status': 'action_started',
+            'step_index': 1,
+            'skill': 'move_to',
+            'object': 'apple',
+            'target': None,
+            'world_revision': 0,
+        },
+        {
+            'status': 'action_completed',
+            'step_index': 1,
+            'skill': 'move_to',
+            'object': 'apple',
+            'target': None,
+            'world_revision': 1,
+        },
+    ]
+    assert run['world_events'] == [
+        {
+            'kind': 'revision_changed',
+            'from_revision': 0,
+            'revision': 1,
+        },
+        {
+            'revision': 1,
+            'event': 'object_slide',
+            'target': 'apple',
+        },
+    ]
+    assert run['failure_reasons'] == ['stale_plan: object_not_in_scene']
+    assert run['plans'][0]['based_on_world_revision'] is None
+
+    builder.on_plan(plan(command='next task'))
+    builder.on_status(status('succeeded', command='next task'))
+    mono.advance(FINAL_GRAPH_WAIT + 0.01)
+    next_run = builder.pop_ready_runs()[0]
+    assert next_run['world_revisions'] == [1]
+
+
+def test_new_scenario_resets_episode_revision_tracking():
+    builder, clock, mono = make_builder()
+    builder.on_environment({
+        'scenario_id': 'episode_a',
+        'category': 'target_pick',
+        'seed': 1,
+        'world_revision': 3,
+    })
+    builder.on_plan(plan(command='episode A'))
+    builder.on_status(status('succeeded', command='episode A'))
+    mono.advance(FINAL_GRAPH_WAIT + 0.01)
+    first = builder.pop_ready_runs()[0]
+    assert first['world_revisions'] == [3]
+
+    builder.on_environment({
+        'scenario_id': 'episode_b',
+        'category': 'recovery',
+        'seed': 2,
+        'world_revision': 0,
+    })
+    builder.on_plan(plan(command='episode B'))
+    builder.on_status(status('succeeded', command='episode B'))
+    mono.advance(FINAL_GRAPH_WAIT + 0.01)
+    second = builder.pop_ready_runs()[0]
+
+    assert second['scenario']['scenario_id'] == 'episode_b'
+    assert second['world_revisions'] == [0]
+
+
 def test_failed_without_replan_flushes_as_failed_on_idle_timeout():
     builder, clock, mono = make_builder()
 
@@ -321,3 +471,31 @@ def test_malformed_message_is_ignored_defensively():
 
     assert len(runs) == 1
     assert runs[0]['outcome'] == 'succeeded'
+
+
+def test_episode_contains_image_instruction_plan_trajectory_and_success():
+    builder, clock, mono = make_builder()
+    builder.on_environment({
+        'scenario_id': 'image_scene_2',
+        'image_path': '/tmp/images/2.png',
+        'source': 'perception',
+        'world_revision': 0,
+    })
+    builder.on_plan(dict(
+        plan(command='put apple into basket'),
+        image_path='/tmp/images/2.png',
+    ))
+    builder.on_trajectory_point({
+        'position': [0.4, 0.1, 0.2],
+        'joint_positions': [0.0] * 7,
+    })
+    builder.on_status(status('succeeded', command='put apple into basket'))
+    mono.advance(FINAL_GRAPH_WAIT + 0.01)
+
+    run = builder.pop_ready_runs()[0]
+
+    assert run['image'] == '/tmp/images/2.png'
+    assert run['instruction'] == 'put apple into basket'
+    assert len(run['plan']) == 1
+    assert len(run['trajectory']) == 1
+    assert run['success'] is True

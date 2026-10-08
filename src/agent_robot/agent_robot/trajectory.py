@@ -37,8 +37,26 @@ OUTCOME_REJECTED = 'rejected'
 OUTCOME_INCOMPLETE = 'incomplete'
 
 # Message fields copied verbatim into run records.
-_PLAN_FIELDS = ('feasible', 'actions', 'planner', 'replans', 'reason')
-_STATUS_FIELDS = ('status', 'action', 'step_index', 'total_steps', 'reason')
+_PLAN_FIELDS = (
+    'feasible',
+    'failure_reason',
+    'actions',
+    'planner',
+    'replans',
+    'reason',
+    'based_on_world_revision',
+    'image_path',
+    'status',
+)
+_STATUS_FIELDS = (
+    'status',
+    'action',
+    'step_index',
+    'total_steps',
+    'reason',
+    'world_revision',
+    'failure_code',
+)
 
 
 def make_run_id(clock):
@@ -58,6 +76,9 @@ class RunBuilder(object):
         self._active = None  # type: (dict | None)
         self._finished = []  # type: (list)
         self._latest_graph = None  # type: (dict | None)
+        self._scenario = {}  # type: dict
+        self._latest_world_revision = None  # type: (int | None)
+        self._current_scenario_id = None  # type: (str | None)
 
     # ------------------------------------------------------------------
     # Inputs
@@ -91,6 +112,28 @@ class RunBuilder(object):
         run['_last_event_mono'] = event['mono']
 
         name = status.get('status')
+        if name in ('action_started', 'action_completed'):
+            action = status.get('action') or {}
+            params = action.get('params') or {}
+            run['action_revisions'].append({
+                'status': name,
+                'step_index': status.get('step_index'),
+                'skill': action.get('skill'),
+                'object': params.get('object', action.get('object')),
+                'target': params.get('target', action.get('target')),
+                'world_revision': status.get('world_revision'),
+            })
+        elif name == 'failed':
+            reason = status.get('reason', '')
+            if reason:
+                run['failure_reasons'].append(reason)
+            run['failures'].append({
+                'failure_code': status.get('failure_code'),
+                'action': status.get('action'),
+                'step_index': status.get('step_index'),
+                'reason': reason,
+            })
+            run['_has_failure'] = True
 
         if name == 'succeeded':
             run['_outcome'] = OUTCOME_SUCCEEDED
@@ -113,6 +156,64 @@ class RunBuilder(object):
 
         if self._active is not None:
             self._active['scene_graph_final'] = graph
+
+    def on_environment(self, environment):
+        # type: (dict) -> None
+        """Track episode identity and monotonically increasing revisions."""
+        if not isinstance(environment, dict):
+            return
+
+        scenario_id = environment.get('scenario_id')
+        if (
+            isinstance(scenario_id, str)
+            and self._current_scenario_id is not None
+            and scenario_id != self._current_scenario_id
+        ):
+            self._latest_world_revision = None
+        if isinstance(scenario_id, str):
+            self._current_scenario_id = scenario_id
+
+        for field in (
+            'scenario_id', 'category', 'seed', 'image_path', 'source'
+        ):
+            if field in environment:
+                self._scenario[field] = environment[field]
+        if self._active is not None:
+            self._active['scenario'].update(self._scenario)
+
+        revision = environment.get('world_revision')
+        if not isinstance(revision, int):
+            return
+        if (
+            self._latest_world_revision is not None
+            and revision <= self._latest_world_revision
+        ):
+            return
+
+        previous = self._latest_world_revision
+        self._latest_world_revision = revision
+
+        if self._active is not None:
+            self._active['world_revisions'].append(revision)
+            if previous is not None:
+                self._active['world_events'].append({
+                    'kind': 'revision_changed',
+                    'from_revision': previous,
+                    'revision': revision,
+                })
+
+    def on_world_event(self, event):
+        # type: (dict) -> None
+        """Record an explicit physics-backend world event."""
+        if isinstance(event, dict) and self._active is not None:
+            self._active['world_events'].append(dict(event))
+
+    def on_trajectory_point(self, payload):
+        # type: (dict) -> None
+        if not isinstance(payload, dict) or self._active is None:
+            return
+        self._active['trajectory'].append(dict(payload))
+        self._active['_last_event_mono'] = self._mono()
 
     # ------------------------------------------------------------------
     # Outputs
@@ -175,9 +276,19 @@ class RunBuilder(object):
             'started_mono': now_mono,
             'finished_mono': None,
             'plans': [],
+            'trajectory': [],
             'events': [],
             'outcome': None,
             'outcome_reason': '',
+            'scenario': dict(self._scenario),
+            'world_revisions': (
+                [self._latest_world_revision]
+                if self._latest_world_revision is not None else []
+            ),
+            'action_revisions': [],
+            'world_events': [],
+            'failure_reasons': [],
+            'failures': [],
             # State just before the run opened (may be the startup graph
             # latched long before this run existed).
             'scene_graph_initial': self._latest_graph,
@@ -206,6 +317,20 @@ class RunBuilder(object):
 
         run['outcome'] = outcome
         run['outcome_reason'] = force_reason or default_reason or ''
+        run['image'] = run['scenario'].get('image_path', '')
+        run['instruction'] = run['command']
+        run['plan'] = list(run['plans'])
+        run['success'] = outcome == OUTCOME_SUCCEEDED
+        run['replans'] = max(
+            [
+                plan.get('replans', 0)
+                for plan in run['plans']
+                if isinstance(plan.get('replans'), int)
+            ] or [0]
+        )
+        run['recovered'] = bool(
+            run['success'] and run['failures'] and run['replans'] > 0
+        )
         run['finished_at'] = self._clock()
         run['finished_mono'] = self._mono()
 
