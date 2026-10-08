@@ -20,7 +20,12 @@ from typing import List, Optional
 import pybullet as p
 import pybullet_data
 
-from agent_robot.scene_graph import OBJECT_CATALOG
+from agent_robot.scene_graph import OBJECT_CATALOG, OBJECT_TYPES
+from agent_robot.perception.coordinate_mapper import (
+    correct_simulation_placements,
+    validate_object_distances,
+)
+from agent_robot.scenarios.spec import FOOTPRINT_HALF_EXTENTS
 from agent_robot.skill_registry import (
     SkillExecutionError,
     SkillRegistry,
@@ -34,6 +39,7 @@ _REALTIME = True
 _END_EFFECTOR_LINK = 11
 _FINGER_JOINTS = [9, 10]
 _PHYSICS_FREQUENCY = 240
+_MOTION_TRACE = []
 
 
 @dataclass
@@ -49,6 +55,10 @@ class ObjectSpec:
     place_rest_position: Optional[List[float]] = None
     graspable: bool = True
     receptacle: Optional[str] = None
+    color: Optional[str] = None
+    visible: bool = True
+    body_ids: Optional[List[int]] = None
+    object_type: Optional[str] = None
 
 
 def create_box(position, half_extents, color):
@@ -80,13 +90,28 @@ def _sleep_steps(simulation_steps):
             time.sleep(1.0 / _PHYSICS_FREQUENCY)
 
 
-def create_scene(connection_mode=p.GUI):
+_COLOR_RGBA = {
+    'red': [0.85, 0.08, 0.08, 1.0],
+    'blue': [0.08, 0.25, 0.90, 1.0],
+    'green': [0.08, 0.65, 0.18, 1.0],
+    'yellow': [0.95, 0.78, 0.08, 1.0],
+}
+
+
+def create_scene(spec=None, connection_mode=p.GUI):
     """Build the tabletop scene.
 
     Returns ``(robot_id, object_table)`` where *object_table* maps canonical
-    object names (``apple`` / ``cup`` / ``basket``) to :class:`ObjectSpec`.
+    object names or episode instance ids to :class:`ObjectSpec`.
+
+    ``spec=None`` retains the original fixed scene. A connection mode passed
+    as the first positional argument is accepted for backwards compatibility.
     """
     global _REALTIME
+    _MOTION_TRACE.clear()
+    if isinstance(spec, int):
+        connection_mode = spec
+        spec = None
     _REALTIME = (connection_mode == p.GUI)
 
     physics_client = p.connect(connection_mode)
@@ -133,6 +158,10 @@ def create_scene(connection_mode=p.GUI):
 
     for joint_index, joint_position in enumerate(initial_joint_positions):
         p.resetJointState(robot_id, joint_index, joint_position)
+
+    if spec is not None:
+        object_table = _create_parameterized_objects(spec)
+        return robot_id, object_table
 
     object_table = {}
 
@@ -236,6 +265,371 @@ def create_scene(connection_mode=p.GUI):
     return robot_id, object_table
 
 
+def _create_parameterized_objects(spec):
+    raw_objects = [
+        {
+            'id': instance.instance_id,
+            'type': instance.object_type,
+            'color': instance.color,
+            'position': list(instance.position),
+        }
+        for instance in spec.objects
+    ]
+    strict_footprints = getattr(spec, 'source', None) == 'perception'
+    placement_is_precomputed = bool(
+        getattr(spec, 'simulation_placement_applied', False)
+    )
+    if strict_footprints:
+        if placement_is_precomputed:
+            simulation_positions = {
+                item['id']: item['position'] for item in raw_objects
+            }
+        else:
+            placement = correct_simulation_placements(
+                raw_objects,
+                getattr(spec, 'allowed_containment', ()),
+            )
+            simulation_positions = {
+                item['id']: item['position']
+                for item in placement['objects']
+            }
+    else:
+        simulation_positions = {
+            item['id']: item['position'] for item in raw_objects
+        }
+    object_table = {}
+    for instance in spec.objects:
+        default_colors = {
+            'apple': _COLOR_RGBA['red'],
+            'cup': _COLOR_RGBA['blue'],
+            'basket': [0.45, 0.22, 0.08, 1.0],
+            'bin': [0.45, 0.22, 0.08, 1.0],
+            'block': [0.55, 0.35, 0.18, 1.0],
+        }
+        rgba = _COLOR_RGBA.get(
+            instance.color,
+            default_colors[instance.object_type],
+        )
+        position = list(simulation_positions[instance.instance_id])
+        object_type = instance.object_type
+        body_ids = []
+        grasp_position = None
+        release_position = None
+        rest_position = None
+
+        if object_type == 'apple':
+            collision = p.createCollisionShape(
+                p.GEOM_SPHERE,
+                radius=0.045,
+            )
+            visual = p.createVisualShape(
+                p.GEOM_SPHERE,
+                radius=0.045,
+                rgbaColor=rgba,
+            )
+            body_id = _create_dynamic_body(
+                collision, visual, position, 0.08
+            )
+            body_ids.append(body_id)
+            grasp_position = [position[0], position[1], position[2] + 0.025]
+        elif object_type == 'cup':
+            collision = p.createCollisionShape(
+                p.GEOM_CYLINDER,
+                radius=0.045,
+                height=0.10,
+            )
+            visual = p.createVisualShape(
+                p.GEOM_CYLINDER,
+                radius=0.045,
+                length=0.10,
+                rgbaColor=rgba,
+            )
+            body_id = _create_dynamic_body(
+                collision, visual, position, 0.1
+            )
+            body_ids.append(body_id)
+            grasp_position = [position[0], position[1], position[2] + 0.025]
+        elif object_type == 'block':
+            half_extents = [0.025, 0.025, 0.025]
+            collision = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=half_extents,
+            )
+            visual = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=half_extents,
+                rgbaColor=rgba,
+            )
+            body_id = _create_dynamic_body(
+                collision, visual, position, 0.05
+            )
+            body_ids.append(body_id)
+            grasp_position = [position[0], position[1], position[2] + 0.025]
+        elif object_type in ('basket', 'bin'):
+            half_x, half_y = FOOTPRINT_HALF_EXTENTS[object_type]
+            base_thickness = 0.015
+            wall_thickness = 0.012
+            wall_height = 0.08 if object_type == 'bin' else 0.09
+            base_center = [position[0], position[1], base_thickness]
+            body_ids.extend(_create_open_container(
+                position,
+                half_x,
+                half_y,
+                base_thickness,
+                wall_thickness,
+                wall_height,
+                rgba,
+                base_center,
+            ))
+            body_id = -1
+            inner_floor = base_thickness * 2.0
+            release_position = [
+                position[0],
+                position[1],
+                inner_floor + 0.08,
+            ]
+            rest_position = [
+                position[0],
+                position[1],
+                inner_floor + 0.035,
+            ]
+        else:
+            raise ValueError(
+                'No PyBullet geometry for object type "{}".'.format(
+                    object_type
+                )
+            )
+
+        above_position = [
+            position[0], position[1], max(position[2] + 0.25, 0.25)
+        ]
+        object_table[instance.instance_id] = ObjectSpec(
+            name=instance.instance_id,
+            body_id=body_id,
+            position=position,
+            above_position=above_position,
+            grasp_position=grasp_position,
+            place_release_position=release_position,
+            place_rest_position=rest_position,
+            graspable=OBJECT_TYPES[object_type].graspable,
+            receptacle=OBJECT_TYPES[object_type].receptacle,
+            color=instance.color,
+            visible=instance.visible,
+            body_ids=body_ids,
+            object_type=object_type,
+        )
+        if not instance.visible:
+            for body_id in body_ids:
+                for link_index in range(
+                    -1, p.getNumJoints(body_id)
+                ):
+                    p.changeVisualShape(
+                        body_id,
+                        link_index,
+                        rgbaColor=rgba[:3] + [0.0],
+                    )
+    _validate_parameterized_scene(
+        object_table,
+        getattr(spec, 'allowed_containment', ()),
+        strict_footprints,
+    )
+    return object_table
+
+
+def _validate_parameterized_scene(
+    object_table, allowed_containment, strict_footprints
+):
+    records = [
+        {
+            'id': object_id,
+            'type': object_spec.object_type,
+            'position': object_spec.position,
+        }
+        for object_id, object_spec in object_table.items()
+    ]
+    if strict_footprints:
+        conflicts = validate_object_distances(
+            records,
+            allowed_containment,
+        )
+        if conflicts:
+            raise RuntimeError(
+                'PyBullet scene initialization has overlapping object '
+                'footprints: {}'.format(conflicts)
+            )
+
+    allowed = {
+        tuple(sorted(pair)) for pair in allowed_containment
+    }
+    object_items = list(object_table.items())
+    for index, (left_id, left) in enumerate(object_items):
+        for right_id, right in object_items[index + 1:]:
+            if tuple(sorted((left_id, right_id))) in allowed:
+                continue
+            for left_body in left.body_ids or []:
+                for right_body in right.body_ids or []:
+                    if p.getClosestPoints(
+                        left_body, right_body, distance=0.0
+                    ):
+                        raise RuntimeError(
+                            'PyBullet scene initialization has physical '
+                            'collision between {} and {}.'.format(
+                                left_id, right_id
+                            )
+                        )
+
+
+def _create_dynamic_body(collision, visual, position, mass):
+    body_id = p.createMultiBody(
+        baseMass=mass,
+        baseCollisionShapeIndex=collision,
+        baseVisualShapeIndex=visual,
+        basePosition=position,
+    )
+    p.changeDynamics(
+        body_id,
+        -1,
+        lateralFriction=0.9,
+        rollingFriction=0.05,
+        spinningFriction=0.05,
+        restitution=0.0,
+    )
+    return body_id
+
+
+def _create_open_container(
+    position,
+    half_x,
+    half_y,
+    base_thickness,
+    wall_thickness,
+    wall_height,
+    rgba,
+    base_center,
+):
+    bodies = []
+    boxes = [
+        (
+            base_center,
+            [half_x, half_y, base_thickness],
+        ),
+        (
+            [
+                position[0],
+                position[1] - half_y,
+                base_center[2] + base_thickness + wall_height,
+            ],
+            [half_x, wall_thickness, wall_height],
+        ),
+        (
+            [
+                position[0],
+                position[1] + half_y,
+                base_center[2] + base_thickness + wall_height,
+            ],
+            [half_x, wall_thickness, wall_height],
+        ),
+        (
+            [
+                position[0] - half_x,
+                position[1],
+                base_center[2] + base_thickness + wall_height,
+            ],
+            [wall_thickness, half_y, wall_height],
+        ),
+        (
+            [
+                position[0] + half_x,
+                position[1],
+                base_center[2] + base_thickness + wall_height,
+            ],
+            [wall_thickness, half_y, wall_height],
+        ),
+    ]
+    for center, half_extents in boxes:
+        bodies.append(create_box(center, half_extents, rgba))
+    return bodies
+
+
+def apply_world_event(object_table, event):
+    """Apply a world event and return its physical acknowledgement."""
+    if not isinstance(event, dict):
+        raise ValueError('World event must be a JSON object.')
+
+    event_name = event.get('event')
+    target_name = event.get('target')
+    spec = object_table.get(target_name)
+    if spec is None:
+        return {
+            'revision': event.get('revision'),
+            'applied': False,
+            'reason': 'unknown_target',
+        }
+
+    if event_name in ('object_slide', 'object_roll'):
+        position = event.get('new_position')
+        if not isinstance(position, (list, tuple)) or len(position) != 3:
+            return {
+                'revision': event.get('revision'),
+                'applied': False,
+                'reason': 'invalid_position',
+            }
+        if spec.body_id < 0:
+            return {
+                'revision': event.get('revision'),
+                'applied': False,
+                'reason': 'target_has_no_rigid_body',
+            }
+        p.resetBasePositionAndOrientation(
+            spec.body_id,
+            position,
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        p.resetBaseVelocity(
+            spec.body_id,
+            linearVelocity=[0.0, 0.0, 0.0],
+            angularVelocity=[0.0, 0.0, 0.0],
+        )
+        for _ in range(12):
+            p.stepSimulation()
+        actual_position = list(
+            p.getBasePositionAndOrientation(spec.body_id)[0]
+        )
+        spec.position = actual_position
+        spec.above_position = [
+            actual_position[0],
+            actual_position[1],
+            max(actual_position[2] + 0.25, 0.25),
+        ]
+        if spec.grasp_position is not None:
+            height_offset = 0.025
+            spec.grasp_position = [
+                actual_position[0],
+                actual_position[1],
+                actual_position[2] + height_offset,
+            ]
+        return {
+            'revision': event.get('revision'),
+            'applied': True,
+            'actual_position': actual_position,
+        }
+
+    if event_name in ('occlude', 'reveal'):
+        return {
+            'revision': event.get('revision'),
+            'applied': True,
+            'actual_position': list(
+                p.getBasePositionAndOrientation(spec.body_id)[0]
+            ) if spec.body_id >= 0 else spec.position,
+        }
+
+    return {
+        'revision': event.get('revision'),
+        'applied': False,
+        'reason': 'unsupported_event',
+    }
+
+
 # ---------------------------------------------------------------------------
 # Internal motion primitives (never registered as plan skills)
 # ---------------------------------------------------------------------------
@@ -254,6 +648,12 @@ def move_to_position(robot_id, target_position, duration=2.0):
         maxNumIterations=200,
         residualThreshold=1e-5
     )
+    _MOTION_TRACE.append({
+        'target_position': [float(value) for value in target_position],
+        'joint_positions': [
+            float(value) for value in joint_targets[:7]
+        ],
+    })
 
     simulation_steps = int(duration * _PHYSICS_FREQUENCY)
 
@@ -383,9 +783,11 @@ def pick_object(robot_id, spec, state):
             )
         )
 
+    _refresh_object_waypoints(spec)
     open_gripper(robot_id)
     move_to_position(robot_id, spec.above_position, duration=2.0)
     move_to_position(robot_id, spec.grasp_position, duration=1.5)
+    _check_grasp_proximity(robot_id, spec)
     close_gripper(robot_id)
 
     constraint_id = attach_object(robot_id, spec.body_id)
@@ -470,6 +872,7 @@ def build_skill_handlers(robot_id, object_table, state):
 
     def handle_move_to(action, context):
         spec = require_spec(action.object)
+        _refresh_object_waypoints(spec)
         move_to_position(robot_id, spec.above_position, duration=2.0)
 
     def handle_pick(action, context):
@@ -486,6 +889,41 @@ def build_skill_handlers(robot_id, object_table, state):
         'pick': handle_pick,
         'place': handle_place,
     }
+
+
+def _refresh_object_waypoints(spec):
+    if spec.body_id < 0:
+        return
+    position = list(p.getBasePositionAndOrientation(spec.body_id)[0])
+    spec.position = position
+    spec.above_position = [
+        position[0],
+        position[1],
+        max(position[2] + 0.25, 0.25),
+    ]
+    if spec.grasp_position is not None:
+        spec.grasp_position = [
+            position[0],
+            position[1],
+            position[2] + 0.025,
+        ]
+
+
+def _check_grasp_proximity(robot_id, spec, max_distance=0.12):
+    link_state = p.getLinkState(
+        robot_id,
+        _END_EFFECTOR_LINK,
+        computeForwardKinematics=True,
+    )
+    object_position = p.getBasePositionAndOrientation(spec.body_id)[0]
+    distance = math.dist(link_state[4], object_position)
+    if distance > max_distance:
+        raise SkillExecutionError(
+            'Grasp target "{}" is {:.3f}m from the gripper '
+            '(maximum {:.3f}m).'.format(
+                spec.name, distance, max_distance
+            )
+        )
 
 
 def main():

@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 .vscode/
 .env
+*.tmp
 trajectories/
-experiments/results/
-experiments/cache/
+/experiments/
+/results/
+/datasets/

@@ -16,6 +16,7 @@ from agent_robot.plan_validator import (
     build_validation_feedback,
     evaluate_generated_plan,
 )
+from agent_robot.ros_qos import ENVIRONMENT_STATE_QOS
 from agent_robot.scene_graph import SceneGraph
 from agent_robot.skill_registry import skill_catalog_text
 
@@ -34,6 +35,23 @@ class TaskPlanner(Node):
 
     def __init__(self):
         super().__init__('task_planner')
+        self.declare_parameter('planner_mode', 'deepseek')
+        self.declare_parameter(
+            'api_url',
+            os.environ.get(
+                'DEEPSEEK_API_URL',
+                'https://api.deepseek.com/chat/completions',
+            ),
+        )
+        self.declare_parameter('api_key_env', 'DEEPSEEK_API_KEY')
+        self.declare_parameter(
+            'model',
+            os.environ.get('DEEPSEEK_CHAT_MODEL', 'deepseek-flash'),
+        )
+        self.planner_mode = self.get_parameter('planner_mode').value
+        self.api_url = self.get_parameter('api_url').value
+        self.api_key_env = self.get_parameter('api_key_env').value
+        self.model = self.get_parameter('model').value
 
         self.command_subscription = self.create_subscription(
             String,
@@ -46,7 +64,7 @@ class TaskPlanner(Node):
             String,
             '/environment_state',
             self.environment_callback,
-            10
+            ENVIRONMENT_STATE_QOS
         )
 
         self.scene_graph_subscription = self.create_subscription(
@@ -77,6 +95,8 @@ class TaskPlanner(Node):
         self.scene_graph_received = False
         self.latest_scene_graph = None
         self.replan_counts = {}
+        self.pending_command = None
+        self.pending_command_timer = None
 
         self.get_logger().info('DeepSeek Task Planner node has started.')
 
@@ -94,6 +114,15 @@ class TaskPlanner(Node):
         if not self.environment_received:
             self.get_logger().info('Environment state received.')
             self.environment_received = True
+
+        if (
+            environment.get('source') == 'perception'
+            and self.pending_command is not None
+        ):
+            command = self.pending_command
+            self.pending_command = None
+            self._clear_pending_command_timer()
+            self._process_command(command)
 
     def scene_graph_callback(self, msg):
         try:
@@ -125,11 +154,25 @@ class TaskPlanner(Node):
         if status_data.get('status') != 'failed':
             return
 
+        if status_data.get('failure_code') != 'grasp_failed':
+            return
+
         command = status_data.get('command', '')
         failed_action = status_data.get('action')
         reason = status_data.get('reason', 'unknown reason')
+        action_data = failed_action if isinstance(failed_action, dict) else {}
+        if action_data.get('skill') != 'pick':
+            return
 
-        replan_count = self.replan_counts.get(command, 0) + 1
+        replan_count = self.replan_counts.get(command, 0)
+        if replan_count >= 1:
+            self.get_logger().error(
+                'grasp_failed recovery limit reached for command: {}'.format(
+                    command
+                )
+            )
+            return
+        replan_count += 1
         self.replan_counts[command] = replan_count
 
         self.get_logger().warning(
@@ -138,8 +181,9 @@ class TaskPlanner(Node):
             )
         )
         self.get_logger().info(
-            'Generating a revised plan with DeepSeek '
-            '(replans={})...'.format(replan_count)
+            'Generating one revised plan with {} (replans={})...'.format(
+                self.planner_mode, replan_count
+            )
         )
 
         failure_context = {
@@ -153,6 +197,7 @@ class TaskPlanner(Node):
             failure_context=failure_context
         )
         revised_plan['command'] = command
+        revised_plan['replans'] = replan_count
 
         if revised_plan.get('feasible'):
             revised_plan['status'] = 'replanned'
@@ -169,16 +214,80 @@ class TaskPlanner(Node):
         )
 
     def command_callback(self, msg):
-        command = msg.data
+        command = msg.data.strip()
+        if not command:
+            self.get_logger().error('Ignoring an empty user command.')
+            return
+
+        if self.current_environment.get('source') != 'perception':
+            if self.pending_command is not None:
+                self._publish_plan(self._rejected_plan(
+                    command,
+                    '已有任务正在等待图片感知场景。',
+                    planner='scene_validator',
+                ))
+                return
+            self.pending_command = command
+            self.pending_command_timer = self.create_timer(
+                90.0, self._expire_pending_command
+            )
+            self.get_logger().info(
+                'Waiting for perception before planning the command.'
+            )
+            return
+
+        self._process_command(command)
+
+    def _process_command(self, command):
+        self.replan_counts[command] = 0
         self.get_logger().info('Received command: {}'.format(command))
-        self.get_logger().info('Generating plan with DeepSeek...')
+        graph = self._validation_graph()
+        if graph is None or not graph.objects:
+            self._publish_plan(self._rejected_plan(
+                command,
+                '尚未收到图片感知场景，不能安全规划。',
+                planner='scene_validator',
+            ))
+            return
+        if graph.source != 'perception':
+            self._publish_plan(self._rejected_plan(
+                command,
+                '当前场景不是图片感知结果，拒绝使用固定目录场景规划。',
+                planner='scene_validator',
+            ))
+            return
+        self.get_logger().info(
+            'Generating a scene-grounded plan with {}.'.format(
+                self.planner_mode
+            )
+        )
 
         plan = self.generate_plan(command)
+        self._publish_plan(plan)
 
+    def _expire_pending_command(self):
+        command = self.pending_command
+        if command is None:
+            self._clear_pending_command_timer()
+            return
+        self.pending_command = None
+        self._clear_pending_command_timer()
+        self._publish_plan(self._rejected_plan(
+            command,
+            '等待图片感知场景超时，不能安全规划。',
+            planner='scene_validator',
+        ))
+
+    def _clear_pending_command_timer(self):
+        timer = self.pending_command_timer
+        self.pending_command_timer = None
+        if timer is not None:
+            self.destroy_timer(timer)
+
+    def _publish_plan(self, plan):
         message = String()
         message.data = json.dumps(plan, ensure_ascii=False)
         self.plan_publisher.publish(message)
-
         self.get_logger().info('Published plan: {}'.format(message.data))
 
     # ------------------------------------------------------------------
@@ -192,7 +301,27 @@ class TaskPlanner(Node):
         from the current perception payload -> ``None`` (skip validation;
         catalog defaults must never masquerade as perception here).
         """
-        if self.latest_scene_graph is not None:
+        if self.current_environment.get('source') == 'perception':
+            perception_revision = self.current_environment.get(
+                'world_revision', 0
+            )
+            if (
+                self.latest_scene_graph is not None
+                and self.latest_scene_graph.source == 'perception'
+                and self.latest_scene_graph.scenario_id
+                == self.current_environment.get('scenario_id')
+                and self.latest_scene_graph.world_revision
+                >= perception_revision
+            ):
+                return self.latest_scene_graph.clone()
+            return SceneGraph.build_from_perception(
+                self.current_environment
+            )
+
+        if (
+            self.latest_scene_graph is not None
+            and self.latest_scene_graph.source == 'perception'
+        ):
             return self.latest_scene_graph.clone()
 
         if self.current_environment.get('objects'):
@@ -213,14 +342,38 @@ class TaskPlanner(Node):
         return names
 
     def generate_plan(self, command, failure_context=None):
-        api_key = os.environ.get('DEEPSEEK_API_KEY')
+        graph = self._validation_graph()
+        if graph is None or graph.source != 'perception':
+            return self._rejected_plan(
+                command,
+                '尚未收到有效的图片感知场景图。',
+                planner='scene_validator',
+            )
+
+        if self.planner_mode == 'mock':
+            return self._mock_plan(command, graph)
+        if self.planner_mode != 'deepseek':
+            return self._rejected_plan(
+                command,
+                'Unsupported planner_mode: {}'.format(self.planner_mode),
+                planner='configuration',
+            )
+
+        api_key = os.environ.get(self.api_key_env)
 
         if not api_key:
             self.get_logger().warning(
-                'DEEPSEEK_API_KEY is not configured. '
-                'Using fallback rejection.'
+                '{} is not configured; rejecting without execution.'.format(
+                    self.api_key_env
+                )
             )
-            return self.fallback_plan(command)
+            return self._rejected_plan(
+                command,
+                '{} is not configured; no plan was generated.'.format(
+                    self.api_key_env
+                ),
+                planner='deepseek',
+            )
 
         if failure_context:
             failure_text = json.dumps(
@@ -236,7 +389,6 @@ class TaskPlanner(Node):
             failure_text = '无，这是首次规划。'
             replans = 0
 
-        graph = self._validation_graph()
         env_names = self._grounding_names(graph)
         object_text = ', '.join(env_names) or '(environment is empty)'
         scene_text = (
@@ -318,15 +470,30 @@ class TaskPlanner(Node):
             )
 
         if evaluation.feasible and evaluation.accepted:
+            reachability_error = self._check_plan_reachability(
+                evaluation.actions, graph
+            )
+            if reachability_error:
+                return self._rejected_plan(
+                    command,
+                    'object_not_reachable: {}'.format(reachability_error),
+                    replans=replans,
+                    planner='scene_validator',
+                )
             return {
                 'command': command,
                 'schema_version': SCHEMA_VERSION,
                 'feasible': True,
                 'reason': evaluation.reason,
+                'failure_reason': '',
                 'actions': evaluation.actions,
                 'planner': 'deepseek',
                 'status': 'planned',
-                'replans': replans
+                'replans': replans,
+                'based_on_world_revision': graph.world_revision,
+                'image_path': self.current_environment.get(
+                    'image_path', ''
+                ),
             }
 
         if evaluation.feasible:
@@ -353,8 +520,13 @@ class TaskPlanner(Node):
 
     def _call_deepseek(self, prompt):
         """Perform one chat-completion API call; return content string."""
+        api_key = os.environ.get(self.api_key_env)
+        if not api_key:
+            raise RuntimeError(
+                '{} is not configured.'.format(self.api_key_env)
+            )
         request_data = {
-            'model': 'deepseek-flash',
+            'model': self.model,
             'messages': [
                 {
                     'role': 'system',
@@ -375,7 +547,7 @@ class TaskPlanner(Node):
         }
 
         request = urllib.request.Request(
-            'https://api.deepseek.com/chat/completions',
+            self.api_url,
             data=json.dumps(request_data).encode('utf-8'),
             headers={
                 'Content-Type': 'application/json',
@@ -384,6 +556,9 @@ class TaskPlanner(Node):
                 )
             },
             method='POST'
+        )
+        request.add_header(
+            'Authorization', 'Bearer {}'.format(api_key)
         )
 
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -489,10 +664,124 @@ class TaskPlanner(Node):
             'schema_version': SCHEMA_VERSION,
             'feasible': False,
             'reason': reason,
+            'failure_reason': reason,
             'actions': [],
             'planner': planner,
             'status': 'rejected',
-            'replans': replans
+            'replans': replans,
+            'based_on_world_revision': (
+                self.latest_scene_graph.world_revision
+                if self.latest_scene_graph is not None else None
+            ),
+            'image_path': self.current_environment.get('image_path', ''),
+        }
+
+    @staticmethod
+    def _check_plan_reachability(actions, graph):
+        """Reject object references without positions in the workspace."""
+        for action in actions:
+            for key in ('object', 'target'):
+                name = action.get(key)
+                if not name:
+                    continue
+                node = graph.objects.get(name)
+                if node is None or node.position is None:
+                    return '{} has no metric position.'.format(name)
+                x, y, z = node.position
+                if not 0.25 <= x <= 0.85:
+                    return '{} x={}m is outside [0.25, 0.85].'.format(
+                        name, x
+                    )
+                if not -0.45 <= y <= 0.45:
+                    return '{} y={}m is outside [-0.45, 0.45].'.format(
+                        name, y
+                    )
+                if not 0.0 <= z <= 0.30:
+                    return '{} z={}m is outside [0.0, 0.30].'.format(
+                        name, z
+                    )
+        return ''
+
+    def _mock_plan(self, command, graph):
+        """Create a deterministic plan for offline ROS integration tests."""
+        from agent_robot.scene_graph import GroundingError, resolve_instance
+
+        normalized = command.strip().lower()
+        object_reference = 'apple'
+        if 'banana' in normalized or '香蕉' in normalized:
+            object_reference = 'banana'
+        elif 'cup' in normalized or '杯子' in normalized:
+            object_reference = 'cup'
+        colors = {
+            'red': '红',
+            'green': '绿',
+            'blue': '蓝',
+            'yellow': '黄',
+        }
+        for color, chinese in colors.items():
+            if color in normalized or chinese in normalized:
+                object_reference = '{} apple'.format(color)
+                break
+        target_reference = 'bin' if (
+            'bin' in normalized
+            or 'box' in normalized
+            or '箱子' in normalized
+            or '盒子' in normalized
+        ) else 'basket'
+        try:
+            object_id = resolve_instance(object_reference, graph)
+            target_id = resolve_instance(target_reference, graph)
+        except GroundingError as error:
+            return self._rejected_plan(
+                command,
+                'scene_grounding_failed: {}'.format(error),
+                planner='mock',
+            )
+
+        actions = [
+            {'skill': 'move_to', 'object': object_id},
+            {'skill': 'pick', 'object': object_id},
+            {'skill': 'move_to', 'object': target_id},
+            {
+                'skill': 'place',
+                'object': object_id,
+                'target': target_id,
+            },
+        ]
+        evaluation = evaluate_generated_plan(
+            {'feasible': True, 'actions': actions},
+            self._grounding_names(graph),
+            graph,
+        )
+        if not evaluation.accepted:
+            return self._rejected_plan(
+                command,
+                'plan_validation_failed: {}'.format(
+                    evaluation.error_detail
+                ),
+                planner='mock',
+            )
+        reachability_error = self._check_plan_reachability(
+            evaluation.actions, graph
+        )
+        if reachability_error:
+            return self._rejected_plan(
+                command,
+                'object_not_reachable: {}'.format(reachability_error),
+                planner='mock',
+            )
+        return {
+            'command': command,
+            'schema_version': SCHEMA_VERSION,
+            'feasible': True,
+            'reason': '',
+            'failure_reason': '',
+            'actions': evaluation.actions,
+            'planner': 'mock',
+            'status': 'planned',
+            'replans': 0,
+            'based_on_world_revision': graph.world_revision,
+            'image_path': self.current_environment.get('image_path', ''),
         }
 
     def fallback_plan(self, command, replans=0):
@@ -507,9 +796,14 @@ class TaskPlanner(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TaskPlanner()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

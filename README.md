@@ -1,16 +1,34 @@
 # EmbodiedPlan
 
-A multimodal embodied-agent prototype built with ROS 2 and DeepSeek.
+**A vision-grounded embodied agent for image-conditioned robot task execution.**
 
-EmbodiedPlan converts visual scene information and natural-language
-instructions into structured robot action plans. It supports pre-execution
-scene-graph feasibility validation, simulated execution, failure feedback,
-automatic replanning, trajectory recording/quality scoring, and a
-reproducible comparative-experiment harness benchmarked against the
-original v0.4 prototype.
+EmbodiedPlan is a ROS 2 research prototype that turns a tabletop image and a
+natural-language instruction into a validated, executable robot task. The
+system detects objects, estimates tabletop positions, builds a structured
+scene graph, plans object-level skills, generates PyBullet motion through
+inverse kinematics, executes the task in simulation, and records the
+resulting episode for inspection and evaluation.
 
-> This project currently uses image-based scene understanding and a
-> simulated robot executor. It does not directly control a physical robot.
+The project supports two operating modes:
+
+- **Local / mock:** OpenCV perception and deterministic mock planning for
+  offline demos and tests.
+- **Real models:** DeepSeek Vision perception and DeepSeek task planning,
+  configured with API credentials in a local `.env` file.
+
+> **Scope:** This is a simulation-focused research prototype, not a physical
+> robot controller. Image-to-world mapping uses a fixed tabletop camera
+> calibration and simulation-only placement correction; it is not general 3D
+> reconstruction. See [Current Limitations](#current-limitations).
+
+## System at a glance
+
+![EmbodiedPlan system architecture: image and instruction input, perception, coordinate mapping, scene graph, task planning, simulation, logging, and Web UI](docs/images/embodiedplan-architecture.png)
+
+*High-level system overview. Numeric callouts drawn inside this conceptual
+illustration are illustrative artwork, not measured benchmark results; use
+the evaluation table in [Final 30-episode evaluation](#final-30-episode-evaluation)
+for the measured project results.*
 
 ## Features
 
@@ -26,9 +44,16 @@ original v0.4 prototype.
 - Automatic failure-aware replanning
 - Execution-trajectory recording and quality scoring (M3)
 - 40-task comparative experiments vs. the v0.4 baseline (M4)
+- Seeded multi-scene simulation with a separate world-truth model (M5)
+- Parameterized PyBullet objects/containers with headless DIRECT validation
 - One-command launch configuration
 
 ## System Architecture
+
+The Web UI is a thin presentation and orchestration layer. It launches the
+existing ROS 2 demo stack, publishes the user's instruction, and displays
+the outputs; perception, planning, validation, execution, and recording
+remain in their existing ROS nodes.
 
 ```mermaid
 flowchart TD
@@ -47,6 +72,11 @@ flowchart TD
     J --> S[Quality Scorer]
 ```
 
+![EmbodiedPlan workflow from image upload and scene understanding through planning, validation, PyBullet execution, recovery, and episode recording](docs/images/embodiedplan-workflow.png)
+
+*End-to-end workflow. A failed grasp can trigger one feedback-driven replan;
+terminal status and trajectory data are recorded as an episode.*
+
 ## Module Roadmap
 
 | Module | Scope |
@@ -55,6 +85,7 @@ flowchart TD
 | **M2** | Symbolic scene graph + pre-execution plan validation (`scene_graph`, `plan_validator`); rejects infeasible tasks before any motion |
 | **M3** | Execution-trajectory recording and quality scoring (`trajectory_recorder`, `trajectory`, `quality_scorer`) |
 | **M4** | 40-task labeled suite and reproducible comparative experiments vs. the v0.4 baseline (`experiments/`) |
+| **M5** | Seeded `SceneSpec` scenarios, instance-aware scene graphs, and a revisioned world model (`scenarios/`, `world_node`) |
 
 ## ROS 2 Nodes
 
@@ -64,6 +95,7 @@ flowchart TD
 | `task_planner` | Uses the environment and user instruction to generate a structured action plan |
 | `task_executor` | Validates preconditions against the scene graph and simulates sequential execution |
 | `environment_node` | Provides a fixed environment for debugging without image input |
+| `world_node` | Publishes a seeded episode's observable world state and applies scripted events |
 | `trajectory_recorder` | Passive observer that records plans/status/scene graph into one run JSON per task |
 
 ## ROS 2 Topics
@@ -77,6 +109,8 @@ flowchart TD
 | `/task_status` | `std_msgs/msg/String` | Execution progress, completion or failure |
 | `/scene_graph` | `std_msgs/msg/String` | Latched symbolic scene graph (objects and relations) |
 | `/simulate_failure` | `std_msgs/msg/String` | Keyword used to inject one simulated failure |
+| `/world_event` | `std_msgs/msg/String` | Relocation event requested by the world model for a physics backend |
+| `/world_event_ack` | `std_msgs/msg/String` | Physics-backend acknowledgement of a world event |
 
 ## Project Structure
 
@@ -93,6 +127,8 @@ ros2_ws/
 │       │   ├── skill_registry.py      # M1 structured skills
 │       │   ├── scene_graph.py         # M2 symbolic world model
 │       │   ├── plan_validator.py      # M2 accept/repair logic
+│       │   ├── world_node.py          # M5 episode truth publisher
+│       │   ├── scenarios/             # M5 specs, generators, world model
 │       │   ├── trajectory.py          # M3 run data model
 │       │   ├── trajectory_recorder.py # M3 recorder node
 │       │   ├── quality_scorer.py      # M3 scoring
@@ -104,7 +140,8 @@ ros2_ws/
 │       │       └── report.py
 │       ├── launch/
 │       │   ├── agent_system.launch.py
-│       │   └── experiment_minimal.launch.py
+│       │   ├── experiment_minimal.launch.py
+│       │   └── scenario_minimal.launch.py
 │       ├── test/
 │       ├── package.xml
 │       ├── setup.cfg
@@ -126,7 +163,8 @@ are not committed to Git.
 - Internet connection
 
 No local GPU is required because visual understanding and task planning
-use the DeepSeek API.
+can use the DeepSeek API. The offline OpenCV detector is available by setting
+`VISION_BACKEND=opencv`.
 
 ## Build
 
@@ -140,19 +178,168 @@ colcon build \
 source install/setup.bash
 ```
 
-## Configure the API Key
+## Configure model APIs
+
+Copy `.env.example` to `.env`, then enter your DeepSeek API key in
+`DEEPSEEK_API_KEY`. `.env` is ignored by Git. The same DeepSeek key is used
+for chat planning and vision by default; set `DEEPSEEK_VISION_API_KEY` only
+if you have a separate key. The vision model/backend can be configured with
+`DEEPSEEK_VISION_MODEL` and `VISION_BACKEND`.
+
+Load the file in the terminal before launching ROS:
 
 For security, enter the API key without displaying it in the terminal:
 
 ```bash
-read -s -p "DeepSeek API Key: " DEEPSEEK_API_KEY
-export DEEPSEEK_API_KEY
-echo
+cd ~/ros2_ws
+cp .env.example .env
+nano .env
+set -a
+source .env
+set +a
 ```
 
 Do not write the API key into source code or commit it to Git.
 
-## Run
+## Recommended demos
+
+Build and source the workspace once:
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/foxy/setup.bash
+colcon build --packages-select agent_robot --symlink-install
+source install/setup.bash
+```
+
+### 1. Single-image vision demo (offline)
+
+```bash
+ros2 launch agent_robot vision_demo.launch.py \
+  image_path:=/home/deerainy/ros2_ws/src/agent_robot/images/2.png \
+  pybullet_connection_mode:=DIRECT \
+  vision_backend:=opencv \
+  planner_mode:=mock
+```
+
+In another sourced terminal, issue a task:
+
+```bash
+ros2 topic pub --once /user_command std_msgs/msg/String \
+  "{data: 'put apple into basket'}"
+```
+
+### 2. Multi-scene benchmark (30 episodes)
+
+```bash
+ros2 run agent_robot generate_benchmark_episodes \
+  --output-dir datasets/m5_benchmark --count 30 --seed 42
+ros2 launch agent_robot benchmark.launch.py \
+  input_dir:=datasets/m5_benchmark \
+  results_path:=experiments/final_results.json \
+  planner_mode:=mock \
+  vision_backend:=synthetic_opencv
+```
+
+The benchmark injects one `grasp_failed` probe in the first episode, then
+records recovery, per-episode data, rates, average trajectory length and
+execution time. See `experiments/final_results.json` and the adjacent
+`experiments/final_results_episodes/` directory. The benchmark uses generated
+RGB only for perception; its `scene_spec.json` ground truth is not passed to
+the planner or detector.
+
+### 3. Real-model demo
+
+Set the API keys in the workspace `.env` file (ignored by Git):
+
+```dotenv
+DEEPSEEK_API_KEY=your_chat_and_vision_key
+DEEPSEEK_VISION_API_KEY=
+```
+
+`DEEPSEEK_API_KEY` is required for planning and is the default vision key.
+`DEEPSEEK_VISION_API_KEY` is optional when vision needs a separate key.
+Optional endpoint/model settings are `DEEPSEEK_API_URL`,
+`DEEPSEEK_CHAT_MODEL`, `DEEPSEEK_VISION_API_URL`, and
+`DEEPSEEK_VISION_MODEL`. The checked-in `.env.example` documents defaults.
+Load these variables without printing their values:
+
+```bash
+cd ~/ros2_ws
+set -a
+source .env
+set +a
+source /opt/ros/foxy/setup.bash
+source install/setup.bash
+```
+
+Start real image perception and DeepSeek planning:
+
+```bash
+ros2 launch agent_robot vision_demo.launch.py \
+  image_path:=/home/deerainy/ros2_ws/src/agent_robot/images/2.png \
+  pybullet_connection_mode:=GUI \
+  vision_backend:=deepseek \
+  planner_mode:=deepseek
+```
+
+In another terminal with the same `.env` loaded, publish the instruction:
+
+```bash
+ros2 topic pub --once /user_command std_msgs/msg/String \
+  "{data: 'put apple into basket'}"
+```
+
+This sends the image to the vision endpoint and the resulting existing
+perception/scene-graph schema to the planner. API availability, supported
+vision models, network access and valid credentials are required; each
+request may incur latency or cost.
+
+### 4. Minimal Web UI
+
+Install Gradio in the Python environment used by ROS 2:
+
+```bash
+python3 -m pip install 'gradio>=3.50,<4'
+```
+
+Start the UI after sourcing ROS and the workspace:
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/foxy/setup.bash
+source install/setup.bash
+ros2 run agent_robot web_demo
+```
+
+Open `http://127.0.0.1:7860`, upload an image, enter a task such as
+`put apple into basket`, and click **Run**. The default `Local / mock` mode
+uses the existing OpenCV perception and mock planner. Select `Real DeepSeek`
+to use the configured VLM and planner APIs; load `.env` in the same terminal
+before starting the UI. The optional PyBullet GUI checkbox opens the simulator
+window when a desktop display is available; headless environments use the
+default DIRECT mode.
+
+Each run launches the existing `vision_demo.launch.py` stack in an isolated
+ROS domain, publishes the task from the UI, and waits for its status and
+trajectory topics. The page shows detections, scene graph, plan, execution
+status, trajectory count, and recovery information. Full ROS launch logs,
+scene graphs, and trajectory episodes are saved under
+`experiments/web_demo/<run_id>/`.
+
+![EmbodiedPlan Gradio interface showing image upload, natural-language task input, Local/mock and Real DeepSeek modes, PyBullet GUI option, and execution results](docs/images/embodiedplan-web-ui.png)
+
+*Web demo screenshot. The displayed run is an example of the UI output, not
+the 30-episode benchmark summary.*
+
+When **Open PyBullet GUI** is selected on a machine with a graphical desktop,
+the existing executor opens its simulator window in a separate process:
+
+![PyBullet GUI showing the simulated robot, tabletop objects, and container](docs/images/pybullet-gui.png)
+
+*PyBullet simulation window from the image-conditioned pick-and-place demo.*
+
+## Other development commands
 
 Start all nodes:
 
@@ -175,6 +362,176 @@ ros2 topic pub --once \
   std_msgs/msg/String \
   "{data: '/home/deerainy/Pictures/scene.png'}"
 ```
+
+For a deterministic M5 mock episode (no image input or physics backend):
+
+```bash
+ros2 launch agent_robot scenario_minimal.launch.py \
+  backend:=mock category:=recovery seed:=7
+```
+
+The launch starts the episode world, executor and trajectory recorder.
+`use_planner:=true` also starts the DeepSeek planner; otherwise, publish a
+structured plan to `/task_plan`. The selected episode state is published on
+`/environment_state`, with monotonically increasing `world_revision` values
+after scripted world changes.
+
+Run the deterministic M5 mock acceptance suite:
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+python3 -m pytest -q src/agent_robot/test/test_mock_episode_e2e.py
+```
+
+Run the parameterized PyBullet DIRECT checks (requires PyBullet):
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+python3 -m pytest -q src/agent_robot/test/test_pybullet_scenarios.py
+```
+
+Run image-to-scene perception on the six supplied photographs:
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+ros2 run agent_robot evaluate_perception \
+  --image-dir src/agent_robot/images --output-dir results
+```
+
+This writes `1_scene_graph.json` through `6_scene_graph.json` plus a
+`summary.json`. The OpenCV detector is a color/texture MVP, not a trained
+general-purpose model. Pixel-to-world coordinates use an affine tabletop
+mapping; calibrate the `world_x_min/max`, `world_y_min/max` and normalized
+`roi_left/top/right/bottom` launch parameters for the camera before using
+estimates for real manipulation. Detection counts and confidence are reported,
+but accuracy/error require hand-annotated ground truth.
+
+Perception coordinates and bounding boxes are retained in the scene graph.
+Before PyBullet initialization, a separate simulation-only placement pass
+clamps boxes to the image, applies object rest heights, and separates
+overlapping footprints while preserving image-indicated containment. Any
+adjustments are reported by `perception_node`; the perception scene graph is
+not rewritten.
+Detections whose boxes lie entirely outside the image are retained in the raw
+perception result, reported as warnings, and excluded from world/simulation
+placement so one malformed model box cannot invalidate the entire frame.
+
+Launch the image-grounded demo with a startup image:
+
+```bash
+ros2 launch agent_robot vision_demo.launch.py \
+  image_path:=src/agent_robot/images/2.png \
+  pybullet_connection_mode:=GUI
+```
+
+Use `pybullet_connection_mode:=DIRECT` for a headless run with no
+visualization window. The PyBullet GUI is the default for interactive runs.
+
+Or start without an image and publish one:
+
+```bash
+ros2 topic pub --once /image_path std_msgs/msg/String \
+  "{data: '/absolute/path/to/image.png'}"
+```
+
+The launch automatically performs image perception, publishes the scene
+graph, plans from natural language, executes in PyBullet, and records an
+episode under `experiments/vision_runs/`. Send only a command to
+`/user_command`; do not publish `/task_plan` manually:
+
+```bash
+ros2 topic pub --once /user_command std_msgs/msg/String \
+  "{data: 'Put the apple into the basket'}"
+```
+
+For an offline pipeline smoke test without a DeepSeek key, pass
+`planner_mode:=mock` to the launch command. The mock planner is deterministic
+and is not an LLM. The default DeepSeek planner requires `DEEPSEEK_API_KEY`.
+The planner outputs high-level skills only; PyBullet computes IK and motion
+from perception-derived object positions. Episode JSON includes the image
+path, instruction, plans, trajectory points and success outcome. Do not
+interpret uncalibrated photo estimates as safe real-robot coordinates.
+
+Generate fixed-camera RGB scenes with metric object labels (requires PyBullet
+and Pillow):
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+ros2 run agent_robot generate_vision_dataset \
+  --output-dir datasets/vision_scenes --count 10 --seed 0
+```
+
+Each `scene_NNNN/` contains `rgb.png` and `scene.json`. The JSON includes
+object type/color, PyBullet world position, visible-image bounding box, camera
+view/projection matrices, and the source `SceneSpec`.
+
+## M5 Multi-scene Image Benchmark
+
+Generate a reproducible set of randomized RGB episodes (object positions,
+apple colors, distractors, and basket/box receptacles vary by seed):
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+ros2 run agent_robot generate_benchmark_episodes \
+  --output-dir datasets/m5_benchmark --count 100 --seed 42
+```
+
+Every `episode_NNNN/` contains `rgb.png`, `scene_spec.json` (initial
+simulation ground truth), and `task.json` (natural-language instruction and
+goal IDs). Ground-truth `scene_spec.json` is not sent to perception or the
+planner.
+
+Run the generated images through the existing perception, scene graph,
+planner, and PyBullet DIRECT pipeline:
+
+```bash
+ros2 launch agent_robot benchmark.launch.py \
+  input_dir:=datasets/m5_benchmark \
+  results_path:=experiments/m5_benchmark/benchmark_results.json \
+  planner_mode:=mock \
+  vision_backend:=synthetic_opencv
+```
+
+The batch runner starts a fresh headless ROS stack per episode. It writes a
+per-episode JSON beside the summary, including perceived scene graph,
+instruction, plan, recorded motion samples, outcome, failure category, and
+timing. `benchmark_results.json` summarizes success rate, perception,
+planning, and execution failures, mean trajectory length, and mean execution
+time. `synthetic_opencv` detects the solid-color shapes in generated images
+directly from RGB pixels; use `opencv` for the photo-oriented local detector.
+`mock` planning is deterministic and offline; use
+`planner_mode:=deepseek` to exercise the online LLM. Likewise,
+`vision_backend:=deepseek` uses the vision API once per episode and may incur
+latency or API cost. The OpenCV detector is an MVP and can report failures on
+unfamiliar object appearances; boxes use the existing `bin` object model.
+The benchmark measures those failures rather than substituting ground-truth
+labels into the perception pipeline. The benchmark selects a separate ROS
+DDS domain by default to avoid exchanging topics with any other running ROS
+stack; set `ros_domain_id:=<0-232>` to choose it explicitly.
+
+### Final 30-episode evaluation
+
+The fixed `datasets/final_evaluation_30` set was run with the offline
+`synthetic_opencv` perception and `mock` planner after the minimal
+reachability-clearance and perception/planner synchronization fixes:
+
+| Metric | Result |
+|---|---:|
+| Task success | 28/30 (93.33%) |
+| Planning failure rate | 3.33% |
+| Execution failure rate | 3.33% |
+| Failure recovery rate | 1/1 (100%; one recovery-probe episode) |
+| Average trajectory length | 7.50 points |
+| Average execution time | 2.8629 s |
+
+The run writes its summary to `experiments/final_results.json` and individual
+episode records alongside it. These generated datasets and experiment outputs
+are local artifacts and are excluded from Git.
 
 ## Test Cases
 
