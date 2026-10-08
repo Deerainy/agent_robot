@@ -1,5 +1,17 @@
 # EmbodiedPlan
 
+<p align="center">
+  <a href="https://github.com/deerainy/agent_robot">
+    <img src="https://img.shields.io/badge/ROS_2-Foxy-22314E?logo=ros" alt="ROS 2 Foxy">
+  </a>
+  <a href="https://www.python.org/">
+    <img src="https://img.shields.io/badge/Python-3.8-3776AB?logo=python&logoColor=white" alt="Python 3.8">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
+  </a>
+</p>
+
 **A vision-grounded embodied agent for image-conditioned robot task execution.**
 
 EmbodiedPlan is a ROS 2 research prototype that turns a tabletop image and a
@@ -30,6 +42,24 @@ illustration are illustrative artwork, not measured benchmark results; use
 the evaluation table in [Final 30-episode evaluation](#final-30-episode-evaluation)
 for the measured project results.*
 
+## Table of contents
+
+- [Features](#features)
+- [System architecture](#system-architecture)
+- [Project structure](#project-structure)
+- [Requirements and installation](#requirements-and-installation)
+- [Configure model APIs](#configure-model-apis)
+- [Demos](#demos)
+  - [Single-image offline demo](#1-single-image-vision-demo-offline)
+  - [Multi-scene benchmark](#2-multi-scene-benchmark-30-episodes)
+  - [Real-model demo](#3-real-model-demo)
+  - [Web UI](#4-minimal-web-ui)
+- [M5 benchmark and results](#m5-multi-scene-image-benchmark)
+- [M4 comparative experiments](#comparative-experiments-m4)
+- [Tests](#tests)
+- [Limitations](#current-limitations)
+- [License](#license)
+
 ## Features
 
 - Image-based scene understanding using DeepSeek Vision
@@ -48,29 +78,12 @@ for the measured project results.*
 - Parameterized PyBullet objects/containers with headless DIRECT validation
 - One-command launch configuration
 
-## System Architecture
+## System architecture
 
 The Web UI is a thin presentation and orchestration layer. It launches the
 existing ROS 2 demo stack, publishes the user's instruction, and displays
 the outputs; perception, planning, validation, execution, and recording
 remain in their existing ROS nodes.
-
-```mermaid
-flowchart TD
-    A[Scene Image] --> B[Vision Node]
-    B -->|environment_state| C[Task Planner]
-    D[User Command] -->|user_command| C
-    C -->|structured actions| V[Plan Validator / Scene Graph]
-    V --> E{Preconditions satisfied?}
-    E -->|No| F[Reject Task]
-    E -->|Yes| G[Task Executor]
-    G --> H{Execution Result}
-    H -->|Completed| I[Task Completed]
-    H -->|Failed| C
-    C -.plans/status/graph.-> R[Trajectory Recorder]
-    R --> J[Run JSON]
-    J --> S[Quality Scorer]
-```
 
 ![EmbodiedPlan workflow from image upload and scene understanding through planning, validation, PyBullet execution, recovery, and episode recording](docs/images/embodiedplan-workflow.png)
 
@@ -124,15 +137,17 @@ ros2_ws/
 │       │   ├── task_planner.py
 │       │   ├── task_executor.py
 │       │   ├── vision_node.py
+│       │   ├── perception/            # Detection, API and coordinate mapping
+│       │   ├── web_demo.py            # Gradio presentation layer
 │       │   ├── skill_registry.py      # M1 structured skills
-│       │   ├── scene_graph.py         # M2 symbolic world model
-│       │   ├── plan_validator.py      # M2 accept/repair logic
-│       │   ├── world_node.py          # M5 episode truth publisher
-│       │   ├── scenarios/             # M5 specs, generators, world model
-│       │   ├── trajectory.py          # M3 run data model
-│       │   ├── trajectory_recorder.py # M3 recorder node
-│       │   ├── quality_scorer.py      # M3 scoring
-│       │   └── experiments/           # M4 suite, runners, report
+│       │   ├── scene_graph.py          # M2 symbolic world model
+│       │   ├── plan_validator.py       # M2 accept/repair logic
+│       │   ├── world_node.py           # M5 episode truth publisher
+│       │   ├── scenarios/              # M5 specs, generators, world model
+│       │   ├── trajectory.py           # M3 run data model
+│       │   ├── trajectory_recorder.py  # M3 recorder node
+│       │   ├── quality_scorer.py       # M3 scoring
+│       │   └── experiments/            # M4 suite, runners, report
 │       │       ├── task_suite.json
 │       │       ├── evaluation.py
 │       │       ├── batch_runner.py
@@ -154,28 +169,39 @@ ros2_ws/
 The `build`, `install`, and `log` directories are generated locally and
 are not committed to Git.
 
-## Requirements
+## Requirements and installation
 
-- Ubuntu 20.04
-- ROS 2 Foxy
-- Python 3.8 or later
-- DeepSeek API key
-- Internet connection
+- Ubuntu 20.04 and ROS 2 Foxy
+- Python 3.8
+- PyBullet and the package's Python dependencies
+- Gradio 3.x only when running the optional Web UI
+- A DeepSeek API key and internet access only for real-model mode
 
 No local GPU is required because visual understanding and task planning
 can use the DeepSeek API. The offline OpenCV detector is available by setting
 `VISION_BACKEND=opencv`.
 
-## Build
+Clone the repository into a ROS 2 workspace's `src/` directory, then build:
 
 ```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+git clone --branch feature/m5-multi-scene-sim \
+  https://github.com/deerainy/agent_robot.git
 cd ~/ros2_ws
 
+source /opt/ros/foxy/setup.bash
 colcon build \
   --packages-select agent_robot \
   --symlink-install
-
 source install/setup.bash
+```
+
+For the Web UI, install the optional frontend dependency in the same Python
+environment used by ROS:
+
+```bash
+python3 -m pip install 'gradio>=3.50,<4'
 ```
 
 ## Configure model APIs
@@ -188,11 +214,10 @@ if you have a separate key. The vision model/backend can be configured with
 
 Load the file in the terminal before launching ROS:
 
-For security, enter the API key without displaying it in the terminal:
-
 ```bash
 cd ~/ros2_ws
 cp .env.example .env
+# Edit .env locally; do not paste the key into a shell command.
 nano .env
 set -a
 source .env
@@ -201,7 +226,7 @@ set +a
 
 Do not write the API key into source code or commit it to Git.
 
-## Recommended demos
+## Demos
 
 Build and source the workspace once:
 
@@ -216,7 +241,7 @@ source install/setup.bash
 
 ```bash
 ros2 launch agent_robot vision_demo.launch.py \
-  image_path:=/home/deerainy/ros2_ws/src/agent_robot/images/2.png \
+  image_path:=src/agent_robot/images/2.png \
   pybullet_connection_mode:=DIRECT \
   vision_backend:=opencv \
   planner_mode:=mock
@@ -277,7 +302,7 @@ Start real image perception and DeepSeek planning:
 
 ```bash
 ros2 launch agent_robot vision_demo.launch.py \
-  image_path:=/home/deerainy/ros2_ws/src/agent_robot/images/2.png \
+  image_path:=src/agent_robot/images/2.png \
   pybullet_connection_mode:=GUI \
   vision_backend:=deepseek \
   planner_mode:=deepseek
@@ -360,7 +385,7 @@ Submit a scene image:
 ros2 topic pub --once \
   /image_path \
   std_msgs/msg/String \
-  "{data: '/home/deerainy/Pictures/scene.png'}"
+  "{data: '/path/to/scene.png'}"
 ```
 
 For a deterministic M5 mock episode (no image input or physics backend):
@@ -675,18 +700,21 @@ them safely.
 ## Current Limitations
 
 - Robot actions are simulated rather than executed on physical hardware.
-- The visual module produces semantic object descriptions rather than
-  precise detection boxes or 3D coordinates.
-- Action feasibility depends partly on large-model reasoning.
+- The OpenCV detector is an MVP; object detection and pixel-to-world position
+  estimates can be inaccurate for unfamiliar images or uncalibrated cameras.
+- Coordinate mapping uses a fixed tabletop calibration, not depth estimation
+  or general-purpose 3D reconstruction.
+- Real-model behavior depends on external API availability, model output and
+  network latency; the offline mock mode is not an LLM.
 - The current prototype processes individual images rather than a
   continuous camera stream.
 - Navigation and manipulation controllers are not yet integrated.
 
 ## Future Work
 
+- Improve detector robustness and camera calibration
+- Add depth-aware position estimation and uncertainty handling
 - ROS camera-stream input
-- Object detection with bounding boxes
-- Depth and spatial-coordinate estimation
 - Gazebo simulation
 - Navigation2 integration
 - MoveIt 2 manipulation
@@ -696,3 +724,8 @@ them safely.
 ## Author
 
 Deerainy
+
+## License
+
+This project is distributed under the MIT License. See [LICENSE](LICENSE)
+for the full text.
